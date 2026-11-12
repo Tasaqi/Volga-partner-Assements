@@ -35,7 +35,8 @@ def test_short_file_returns_json(client, make_tone):
         "id": 1, "start": 0.0, "end": 2.5, "text": "mock segment 1", "confidence": 0.9048
     }
     assert set(body["metadata"]) == {
-        "engine", "model", "chunks", "chunks_cut_in_silence", "processing_seconds", "source_format"
+        "engine", "model", "chunks", "chunks_cut_in_silence", "fallback_chunks",
+        "processing_seconds", "source_format",
     }
     assert body["metadata"]["source_format"]["container"] == "mp3"
 
@@ -96,3 +97,16 @@ def test_too_long_audio_returns_413(cfg, engine, make_tone):
 
 def test_unknown_job_returns_404(client):
     assert client.get("/transcriptions/does-not-exist").status_code == 404
+
+
+def test_api_key_required_when_configured(cfg, engine, make_tone):
+    app = create_app(replace(cfg, api_key="s3cret"), engine)
+    path = make_tone("hello.mp3", 2.0, "-c:a", "libmp3lame")
+    with TestClient(app) as c:
+        assert c.get("/health").status_code == 200  # probes stay open
+        assert post(c, path).status_code == 401
+        assert c.get("/transcriptions/nope", headers={"X-API-Key": "wrong"}).status_code == 401
+        with path.open("rb") as f:
+            r = c.post("/transcriptions", files={"file": (path.name, f)},
+                       headers={"X-API-Key": "s3cret"})
+        assert r.status_code == 200

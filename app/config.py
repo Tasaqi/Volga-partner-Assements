@@ -13,10 +13,19 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class Settings:
     # Engine
-    engine: str = "faster-whisper"  # "faster-whisper" | "mock"
+    # Primary: hosted OpenAI Whisper (needs OPENAI_API_KEY). "faster-whisper" | "openai" | "mock"
+    engine: str = "openai"
+    # Used when the primary fails, so the hosted API degrades to open-source Whisper
+    # instead of erroring. "none" (or the same name as ``engine``) disables it.
+    fallback_engine: str = "faster-whisper"
+    fallback_cooldown_s: float = 60.0  # skip a failing primary for this long
+    openai_model: str = "whisper-1"
     model_size: str = "base"  # tiny | base | small | medium | large-v3
     device: str = "cpu"  # cpu | cuda | auto
     compute_type: str = "int8"
+
+    # Auth: when set, /transcriptions requires header "X-API-Key: <value>". Empty = open.
+    api_key: str = ""
 
     # Input limits
     max_upload_mb: int = 500

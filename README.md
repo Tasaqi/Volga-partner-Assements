@@ -2,12 +2,12 @@
 
 A speech-to-text service you can run two ways: as an HTTP API (FastAPI) or from the command line. Send it an audio or video file in any common format, of any length up to 4 hours. It returns a transcript with absolute timestamps for every segment, as JSON, SRT, VTT or plain text.
 
-Transcription uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper), the open-source Whisper model running on CTranslate2. No model is trained here. All decoding, probing and silence detection go through `ffmpeg` and `ffprobe`.
+Transcription uses the **OpenAI Whisper API** as the primary engine. If an API call fails, or no `OPENAI_API_KEY` is set, the service falls back to [faster-whisper](https://github.com/SYSTRAN/faster-whisper), the open-source Whisper model running locally on CTranslate2. A failure costs only the affected chunk, not the request. No model is trained here. All decoding, probing and silence detection go through `ffmpeg` and `ffprobe`.
 
 | | |
 |---|---|
 | Runtime | Python 3.11+, FastAPI, Uvicorn, Pydantic v2 |
-| Speech-to-text | faster-whisper (`int8`, VAD on, beam 5) |
+| Speech-to-text | OpenAI Whisper API (`whisper-1`), falling back to faster-whisper (`int8`, VAD on, beam 5) |
 | Audio | ffmpeg / ffprobe via `subprocess` |
 | Tests | pytest + httpx. Fixtures are generated with ffmpeg `lavfi`, so the repo holds no binary files |
 
@@ -19,7 +19,8 @@ Requires `ffmpeg` on `PATH` (`brew install ffmpeg` / `apt-get install ffmpeg`).
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
+cp .env.example .env    # settings and credentials live here; never commit it
 ```
 
 ### CLI
@@ -30,12 +31,14 @@ python cli.py lecture.mp4                       # JSON to stdout, language auto-
 python cli.py input.wav --engine mock           # offline demo, no model download
 ```
 
+Set `OPENAI_API_KEY` to use the OpenAI API, with local Whisper as the fallback. Without a key, everything runs locally on faster-whisper.
+
 Progress is printed to stderr. Exit code `2` means the input was rejected (not audio, too long).
 
 ### API
 
 ```bash
-uvicorn app.api:create_app --factory --port 8000
+uvicorn app.api:create_app --factory --env-file .env --port 8000
 
 curl -F "file=@meeting.m4a" "localhost:8000/transcriptions?language=en"
 curl -F "file=@meeting.m4a" "localhost:8000/transcriptions?format=srt"
@@ -52,7 +55,7 @@ Interactive docs: <http://localhost:8000/docs>
 ```bash
 docker build -t transcription-pipeline .                          # bakes in the "base" model
 docker build --build-arg MODEL_SIZE=small -t transcription-pipeline .
-docker run -p 8000:8000 transcription-pipeline
+docker run --env-file .env -p 8000:8000 transcription-pipeline
 ```
 
 The model is downloaded while the image builds, and the container runs with `HF_HUB_OFFLINE=1`, so it starts without network access. Without that setting, every cold start checks Hugging Face Hub, which added more than a minute in testing.
@@ -81,6 +84,7 @@ The tests use `MockEngine`, so they never download a model. They take about 5 se
 | 413 | Upload larger than `TP_MAX_UPLOAD_MB`, or audio longer than `TP_MAX_DURATION_S` |
 | 415 | Not decodable audio: a corrupt file, a non-media file with an audio extension, or a video with no audio track |
 | 422 | Invalid query parameter, e.g. `format=docx` |
+| 500 / 502 | Every configured engine failed (500: local engine, 502: upstream API). With the default fallback, an API failure alone never causes this |
 
 A failed job returns `status: "failed"` with an `error` message.
 
@@ -106,6 +110,7 @@ A failed job returns `status: "failed"` with an `error` message.
     "model": "tiny",
     "chunks": 1,
     "chunks_cut_in_silence": 0,
+    "fallback_chunks": 0,
     "processing_seconds": 1.442,
     "source_format": {
       "codec": "aac",
@@ -147,7 +152,7 @@ This is real output from the `tiny` model on a macOS `say` recording. `processin
         ▼                                                                 │
  ┌──────────────┐  extract chunk ─► engine.transcribe ─► delete chunk     │
  │  transcribe  │  TP_CHUNK_WORKERS in parallel, progress after each ─────┘ (job.progress)
- └──────┬───────┘
+ └──────┬───────┘  engine = OpenAI API ──fails──► faster-whisper (same chunk)
         ▼
  ┌──────────────┐  shift to absolute time; keep segment only in the chunk
  │    merge     │  whose OWNED range holds its midpoint; sort by start
@@ -165,12 +170,13 @@ This is real output from the `tiny` model on a macOS `say` recording. `processin
 | [`app/config.py`](app/config.py) | `Settings` dataclass read from `TP_*` environment variables |
 | [`app/schemas.py`](app/schemas.py) | Pydantic models: `Segment`, `Metadata`, `TranscriptionResult`, `Job`, `JobStatus`, `OutputFormat` |
 | [`app/audio.py`](app/audio.py) | `probe`, `normalise`, `detect_silences`, `plan_chunks`, `extract`, and the input error types |
-| [`app/engines.py`](app/engines.py) | The `TranscriptionEngine` protocol, `FasterWhisperEngine` (model loaded through `lru_cache`), and `MockEngine` |
+| [`app/engines.py`](app/engines.py) | The `TranscriptionEngine` protocol, `OpenAIEngine`, `FasterWhisperEngine` (model loaded through `lru_cache`), `FallbackEngine` (with a circuit breaker), and `MockEngine` |
+| [`app/languages.py`](app/languages.py) | Whisper language names mapped to ISO codes (the API returns `"english"`, faster-whisper returns `"en"`) |
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, upload streaming, in-memory `JobStore`, HTTP error mapping |
 | [`cli.py`](cli.py) | Command-line wrapper around `transcribe_file` |
-| [`tests/`](tests/) | 40 tests covering audio, chunking, post-processing, the pipeline and the API |
+| [`tests/`](tests/) | 57 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API and auth |
 
 ---
 
@@ -205,17 +211,34 @@ This is real output from the `tiny` model on a macOS `say` recording. `processin
 - **Confidence.** `clamp(exp(avg_logprob), 0, 1)` is the geometric mean of the token probabilities: easy to read, and good for flagging segments that need human review.
 - **Language.** If none is given, Whisper detects it. For chunked files, the first chunk that contains speech decides, because detection on a silent chunk is unreliable.
 
+### Engines and fallback
+
+- **OpenAI first, open source as the safety net.** The hosted `whisper-1` model needs no GPU and responds quickly, so it is the primary engine. Local faster-whisper is the fallback, so an outage, a rate limit or an expired key degrades quality or speed instead of failing the request.
+- **Fallback runs per chunk, not per file.** `FallbackEngine` wraps any two engines. If the primary raises `TranscriptionError`, the same chunk is retried on the fallback with the same language. On a 2-hour file with one bad API call, only that one 10-minute chunk is re-transcribed locally.
+- **Retry first, then fall back.** The OpenAI SDK already retries 429, 5xx and connection errors with exponential backoff (`max_retries=2`, 120 s timeout). The fallback only starts after those retries are used up.
+- **Circuit breaker.** After a primary failure, the primary is skipped for `TP_FALLBACK_COOLDOWN_S` (60 s). During a real outage, chunks go straight to the fallback instead of each waiting out the retries.
+- **Fail at startup, not mid-outage.** The fallback model is loaded when the service starts. A broken fallback should stop the deploy, not appear for the first time during an OpenAI incident. A missing `OPENAI_API_KEY` logs a warning and the service runs on local Whisper only, so it still works offline and in CI.
+- **Errors from both engines look the same.** OpenAI SDK errors and local CTranslate2 `RuntimeError`s (for example, out of memory) both become `TranscriptionError`. That makes the reverse chain work too (`TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=openai`). If both engines fail, the error message names both causes.
+- **Traceable output.** `metadata.engine` shows the chain (`openai+faster-whisper`) and `metadata.fallback_chunks` counts how many chunks the fallback produced. A drop in quality can then be traced to its cause.
+- **Same output from both engines.** Each chunk is sent to OpenAI as lossless FLAC, about half the size of WAV: a 10-minute chunk is roughly 10 MB, well under the API's 25 MB limit. The request uses `verbose_json`, so the response includes `avg_logprob` and `no_speech_prob`, and the confidence score and hallucination filter work exactly as they do for local output. Language names are mapped to ISO codes.
+- **Privacy trade-off.** The default sends audio to OpenAI. For sensitive recordings, set `TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=none` and audio never leaves the machine.
+
 ### Extensibility
 
-The pipeline only knows the `TranscriptionEngine` protocol (`name`, `model`, `transcribe(wav_path, language)`, `is_loaded()`). Adding OpenAI's API, Deepgram or AssemblyAI takes one new class plus one branch in `build_engine`. Engines always receive a clean 16 kHz mono WAV of at most one chunk, so the 25 MB upload limit on hosted APIs is already respected. `create_app(cfg, engine)` takes both dependencies as arguments, which is how the tests run against `MockEngine` with small chunk settings.
+The pipeline only knows the `TranscriptionEngine` protocol (`name`, `model`, `transcribe(wav_path, language)`, `is_loaded()`). Adding Deepgram or AssemblyAI takes one new class plus one branch in `build_engine`, and `FallbackEngine` can chain it with any other engine. Engines always receive a clean 16 kHz mono WAV of at most one chunk. `create_app(cfg, engine)` takes both dependencies as arguments, which is how the tests run against `MockEngine` with small chunk settings.
 
 ### Configuration
 
-All settings are environment variables prefixed with `TP_`:
+All settings are environment variables prefixed with `TP_`. [`.env.example`](.env.example) lists them all; copy it to `.env` (git- and docker-ignored) and pass it with `--env-file`. The CLI reads the shell environment, so load it with `set -a; source .env; set +a`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `TP_ENGINE` | `faster-whisper` | `faster-whisper` or `mock` |
+| `TP_API_KEY` | *(empty)* | When set, `/transcriptions` endpoints require header `X-API-Key: <value>` (401 otherwise). `/health` stays open for probes. Empty disables auth |
+| `TP_ENGINE` | `openai` | Primary engine: `openai`, `faster-whisper` or `mock` |
+| `OPENAI_API_KEY` | *(empty)* | Used by the OpenAI SDK. If unset, the service runs on the fallback engine only |
+| `TP_OPENAI_MODEL` | `whisper-1` | Hosted model. It must support `verbose_json` segments |
+| `TP_FALLBACK_ENGINE` | `faster-whisper` | Used when the primary fails. `none` disables the fallback |
+| `TP_FALLBACK_COOLDOWN_S` | `60` | How long to skip a failing primary (circuit breaker) |
 | `TP_MODEL_SIZE` | `base` | `tiny`, `base`, `small`, `medium`, `large-v3` |
 | `TP_DEVICE` | `cpu` | `cpu`, `cuda`, `auto` |
 | `TP_COMPUTE_TYPE` | `int8` | CTranslate2 compute type (`float16` on GPU) |
@@ -235,7 +258,7 @@ All settings are environment variables prefixed with `TP_`:
 | Option | Decision | Why |
 |---|---|---|
 | `openai-whisper` (reference implementation) | **faster-whisper** | Same model weights, up to 4x faster with less memory (the project's published benchmarks), and supports `int8` on CPU. It includes a Silero VAD filter, so a separate VAD step isn't needed. |
-| Hosted API only (OpenAI, Deepgram) | **Local model, API engines pluggable** | No per-minute cost, and audio never leaves the machine, which matters for sensitive recordings. A hosted engine is one class away if latency or GPU cost becomes the constraint. |
+| Hosted API only, or local model only | **OpenAI API with a per-chunk local fallback** | The API is fast and needs no GPU, but it is an external dependency with outages and rate limits. Local Whisper costs nothing per minute and is always available. Combining them gives the API's speed with local availability. Sensitive deployments can switch to local only with one setting. |
 | PyAV / pydub for decoding | **ffmpeg / ffprobe subprocess** | ffmpeg is the most complete decoder available, its CLI interface is stable, and probing, normalising and `silencedetect` all use one tool. Running it as a subprocess also keeps a crash on a malformed file out of the API process. |
 | Trust the extension or MIME type | **Probe the content** | Both are client-controlled. ffprobe reading the actual streams is the only reliable check. |
 | Fixed-size chunks | **Silence-snapped chunks, with overlap as fallback** | Fixed cuts split words, and Whisper then garbles both halves. Snapping costs one fast `silencedetect` pass. The overlap plus midpoint ownership keeps hard cuts correct too. |
@@ -251,6 +274,6 @@ All settings are environment variables prefixed with `TP_`:
 3. **Speaker diarization** (pyannote) merged onto segments, giving `speaker` labels.
 4. **Word-level timestamps** (`word_timestamps=True`) for subtitle editing and search.
 5. **Quality tracking.** WER on a held-out, domain-specific labelled set in CI, run on every model or setting change, plus confidence distributions in production dashboards.
-6. **Authentication and rate limits.** API keys or OAuth, per-tenant quotas on minutes of audio, request size limits at the gateway.
+6. **Authentication and rate limits.** Per-tenant API keys or OAuth (today: one shared `TP_API_KEY`), per-tenant quotas on minutes of audio, request size limits at the gateway.
 7. **Retention policy.** Delete audio after N days, encrypt at rest, offer PII redaction, and log access to transcripts.
 8. **Operations.** Structured logs, Prometheus metrics (real-time factor, queue latency, failure rate), tracing, and graceful shutdown that hands unfinished jobs back to the queue.

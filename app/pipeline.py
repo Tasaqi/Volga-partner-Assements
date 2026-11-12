@@ -125,6 +125,7 @@ def transcribe_file(
             model=engine.model,
             chunks=len(chunks),
             chunks_cut_in_silence=sum(c.end_in_silence for c in chunks),
+            fallback_chunks=sum(r.fallback for r in engine_results),
             processing_seconds=round(time.monotonic() - started, 3),
             source_format=info.as_metadata(),
         ),

@@ -5,6 +5,7 @@ Run: ``uvicorn app.api:create_app --factory --port 8000``
 
 from __future__ import annotations
 
+import secrets
 import shutil
 import tempfile
 import threading
@@ -13,13 +14,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from app import pipeline
 from app.audio import AudioError, AudioInfo, AudioTooLongError, UnsupportedAudioError
 from app.config import Settings
-from app.engines import TranscriptionEngine, build_engine
+from app.engines import TranscriptionEngine, TranscriptionError, build_engine
 from app.postprocess import MEDIA_TYPES, render
 from app.schemas import Job, JobStatus, OutputFormat, TranscriptionResult
 
@@ -102,11 +103,19 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
         yield
         executor.shutdown(wait=False, cancel_futures=True)
 
+    def require_api_key(x_api_key: str | None = Header(None)) -> None:
+        if cfg.api_key and not secrets.compare_digest((x_api_key or "").encode(), cfg.api_key.encode()):
+            raise HTTPException(401, "Invalid or missing X-API-Key")
+
     app = FastAPI(title="Transcription Pipeline", version="1.0.0", lifespan=lifespan)
 
     @app.exception_handler(AudioError)
     async def audio_error(_: Request, exc: AudioError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=ERROR_STATUS.get(type(exc), 400))
+
+    @app.exception_handler(TranscriptionError)
+    async def engine_error(_: Request, exc: TranscriptionError) -> JSONResponse:
+        return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -136,6 +145,7 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
     @app.post(
         "/transcriptions",
         responses={202: {"description": "Long file accepted as a background job"}},
+        dependencies=[Depends(require_api_key)],
     )
     def create_transcription(
         file: UploadFile,
@@ -168,7 +178,7 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
             if not handed_off:
                 shutil.rmtree(workdir, ignore_errors=True)
 
-    @app.get("/transcriptions/{job_id}")
+    @app.get("/transcriptions/{job_id}", dependencies=[Depends(require_api_key)])
     def get_transcription(job_id: str) -> Response:
         found = jobs.get(job_id)
         if found is None:

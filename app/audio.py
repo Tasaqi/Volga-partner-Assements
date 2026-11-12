@@ -61,6 +61,10 @@ class Chunk:
     end_in_silence: bool  # True if the boundary at owned_end was snapped to a silence
 
 
+# Uploaded files are untrusted: an HLS playlist could make ffmpeg fetch URLs (SSRF).
+LOCAL_ONLY = ["-protocol_whitelist", "file"]
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
@@ -71,7 +75,7 @@ def probe(path: Path) -> AudioInfo:
     proc = _run(
         [
             "ffprobe", "-v", "error", "-print_format", "json",
-            "-show_format", "-show_streams", "-select_streams", "a", str(path),
+            "-show_format", "-show_streams", "-select_streams", "a", *LOCAL_ONLY, str(path),
         ]
     )
     if proc.returncode != 0:
@@ -105,12 +109,20 @@ def normalise(src: Path, dst: Path) -> Path:
     """Decode any input to 16 kHz mono 16-bit PCM WAV (drops video)."""
     proc = _run(
         [
-            "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src),
+            "ffmpeg", "-nostdin", "-v", "error", "-y", *LOCAL_ONLY, "-i", str(src),
             "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", str(dst),
         ]
     )
     if proc.returncode != 0 or not dst.exists():
         raise UnsupportedAudioError(f"Could not decode audio: {proc.stderr.strip()[-300:]}")
+    return dst
+
+
+def encode_flac(src_wav: Path, dst: Path) -> Path:
+    """Lossless FLAC copy of a canonical WAV (for uploading to hosted APIs)."""
+    proc = _run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src_wav), "-c:a", "flac", str(dst)])
+    if proc.returncode != 0:
+        raise AudioError(f"FLAC encoding failed: {proc.stderr.strip()[-300:]}")
     return dst
 
 

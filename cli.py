@@ -11,7 +11,7 @@ from pathlib import Path
 
 from app.audio import AudioError
 from app.config import Settings
-from app.engines import build_engine
+from app.engines import TranscriptionError, build_engine
 from app.pipeline import transcribe_file
 from app.postprocess import render
 from app.schemas import OutputFormat
@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-o", "--output", type=Path, help="write here instead of stdout")
     parser.add_argument("--model", help="Whisper model size (default: TP_MODEL_SIZE or base)")
     parser.add_argument("--language", help='ISO code, e.g. "en"; auto-detect if omitted')
-    parser.add_argument("--engine", choices=["faster-whisper", "mock"], help="default: TP_ENGINE")
+    parser.add_argument("--engine", choices=["faster-whisper", "openai", "mock"], help="default: TP_ENGINE")
     args = parser.parse_args(argv)
 
     if not args.input.is_file():
@@ -43,6 +43,9 @@ def main(argv: list[str] | None = None) -> int:
     except AudioError as exc:
         print(f"\nerror: {exc}", file=sys.stderr)
         return 2
+    except TranscriptionError as exc:
+        print(f"\ntranscription failed: {exc}", file=sys.stderr)
+        return 1
     print(file=sys.stderr)
 
     body = render(result, OutputFormat(args.format))

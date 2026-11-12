@@ -28,6 +28,7 @@ class Metadata(BaseModel):
     model: str
     chunks: int
     chunks_cut_in_silence: int = Field(description="Chunk boundaries snapped to a silence")
+    fallback_chunks: int = Field(0, description="Chunks transcribed by the fallback engine")
     processing_seconds: float
     source_format: dict[str, str | int | float | None] = Field(
         description="codec, container, sample_rate, channels of the uploaded file"
