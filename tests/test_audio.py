@@ -80,3 +80,18 @@ def test_ffmpeg_timeout_becomes_unsupported_audio(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(audio.subprocess, "run", hang)
     with pytest.raises(UnsupportedAudioError, match="timed out"):
         audio.probe(tmp_path / "upload")
+
+
+def test_ffmpeg_and_ffprobe_only_read_local_files(monkeypatch, tmp_path: Path):
+    # An uploaded playlist must not make ffmpeg fetch URLs (SSRF): both tools get the whitelist.
+    seen = []
+    real_run = audio._run
+    monkeypatch.setattr(audio, "_run", lambda cmd: seen.append(cmd) or real_run(cmd))
+    playlist = tmp_path / "upload"
+    playlist.write_text("ffconcat version 1.0\nfile http://127.0.0.1:9/secret.wav\n")
+    with pytest.raises(UnsupportedAudioError):
+        audio.probe(playlist)
+    with pytest.raises(UnsupportedAudioError):
+        audio.normalise(playlist, tmp_path / "out.wav")
+    assert [cmd[0] for cmd in seen] == ["ffprobe", "ffmpeg"]
+    assert all("-protocol_whitelist" in cmd and "file" in cmd for cmd in seen)

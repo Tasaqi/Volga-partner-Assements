@@ -175,7 +175,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, `RequestGuard` (auth and size checked before the body is read), upload streaming, in-memory `JobStore`, HTTP error mapping |
-| [`tests/`](tests/) | 85 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
+| [`tests/`](tests/) | 86 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
 
 ---
 
@@ -194,6 +194,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 
 - **The file extension is never trusted.** Uploads are saved as `upload` with no extension, and `ffprobe` decides what the content is. A file is accepted only if it has a real audio stream and a positive duration. A text file renamed `.mp3`, a corrupt file, or a video without an audio track gets a **415** with a clear message.
 - **One canonical format.** Every input is converted once to **16 kHz, mono, 16-bit PCM WAV** (`-vn -ac 1 -ar 16000 -c:a pcm_s16le`). 16 kHz mono is what Whisper consumes internally. Nothing after this step handles codecs. That includes chunk extraction, which slices the WAV by frame index using the stdlib `wave` module: it is sample-exact and needs no extra ffmpeg process per chunk. It also covers handing audio to Whisper, which receives a float32 array directly instead of decoding the file a second time.
+- **Local files only.** Every ffprobe and ffmpeg call runs with `-protocol_whitelist file`, so an uploaded playlist (HLS, ffconcat) cannot make ffmpeg fetch URLs on the server's network (SSRF). Recent ffmpeg versions also refuse unsafe playlist entries by default; the flag keeps that guarantee regardless of version.
 - **The source format is recorded.** `metadata.source_format` keeps the original codec, container, sample rate and channel count, which helps debug quality problems ("why is this transcript bad?" → "8 kHz phone audio").
 - **Tested formats:** WAV, MP3, M4A/AAC, OGG (Opus), FLAC, and an AAC track inside MP4 video. Anything ffmpeg can decode works.
 
