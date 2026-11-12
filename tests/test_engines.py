@@ -235,3 +235,13 @@ def test_model_loads_once_when_threads_race(monkeypatch):
         assert len(created) == 1 and engine.is_loaded()
     finally:
         engines._load_whisper.cache_clear()
+
+
+def test_chunk_settings_must_keep_openai_uploads_under_25_mb(offline_engines):
+    from app.config import Settings
+
+    # defaults: 600 + 30 + 2 x 2 = 634 s -> ~20 MB worst case
+    assert build_engine(Settings(engine="openai")).name == "openai+faster-whisper"
+    with pytest.raises(ValueError, match="25 MB"):
+        build_engine(Settings(engine="openai", chunk_seconds=900))  # 934 s -> ~30 MB
+    assert build_engine(Settings(engine="faster-whisper", chunk_seconds=900)).name == "faster-whisper"

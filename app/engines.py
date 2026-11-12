@@ -264,6 +264,23 @@ def _single_engine(name: str, cfg: Settings) -> TranscriptionEngine:
     raise ValueError(f"Unknown engine {name!r} (expected 'faster-whisper', 'openai' or 'mock')")
 
 
+# OpenAI rejects uploads over 25 MB. FLAC of noisy audio is about as large as 16-bit PCM,
+# so bound the longest possible chunk at startup instead of discovering it chunk by chunk.
+OPENAI_MAX_UPLOAD_BYTES = 25_000_000
+
+
+def _check_openai_chunk_size(cfg: Settings) -> None:
+    longest_s = cfg.chunk_seconds + cfg.silence_search_s + 2 * cfg.chunk_overlap_s
+    worst_bytes = longest_s * audio.SAMPLE_RATE * 2  # 16-bit mono PCM
+    if worst_bytes > OPENAI_MAX_UPLOAD_BYTES:
+        limit_s = OPENAI_MAX_UPLOAD_BYTES // (audio.SAMPLE_RATE * 2)
+        raise ValueError(
+            f"Chunks can reach {longest_s:.0f}s (~{worst_bytes / 1e6:.0f} MB), over OpenAI's 25 MB "
+            f"upload limit: keep TP_CHUNK_SECONDS + TP_SILENCE_SEARCH_S + 2 x TP_CHUNK_OVERLAP_S "
+            f"<= {limit_s}s"
+        )
+
+
 def build_engine(cfg: Settings) -> TranscriptionEngine:
     names = [cfg.engine]
     # The mock engine is for offline tests and demos, so it is never wrapped.
@@ -276,6 +293,8 @@ def build_engine(cfg: Settings) -> TranscriptionEngine:
             raise ValueError("TP_ENGINE=openai needs OPENAI_API_KEY (or a TP_FALLBACK_ENGINE)")
         log.warning("OPENAI_API_KEY not set: using %s only", names[0])
 
+    if "openai" in names:
+        _check_openai_chunk_size(cfg)
     engines = [_single_engine(name, cfg) for name in names]
     for e in engines:
         if isinstance(e, FasterWhisperEngine):
