@@ -3,11 +3,12 @@ import math
 import struct
 import wave
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
 from transcriber.api import app
-from transcriber.audio import WHISPER_SAMPLE_RATE
+from transcriber.audio import WHISPER_SAMPLE_RATE, iter_chunks
 from transcriber.engines import Segment, Transcription, get_transcriber
 
 
@@ -21,6 +22,11 @@ def make_wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> byte
         frame = lambda i: struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / rate)))
         w.writeframes(b"".join(frame(i) * channels for i in range(int(seconds * rate))))
     return buf.getvalue()
+
+
+def load_audio(path) -> np.ndarray:
+    """Decode a whole (short) file through the production decoder, as one array."""
+    return np.concatenate([samples for _, samples in iter_chunks(path, chunk_seconds=3600)])
 
 
 class FakeTranscriber:

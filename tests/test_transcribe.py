@@ -4,8 +4,8 @@ import numpy as np
 import openai
 import pytest
 
-from conftest import make_wav
-from transcriber.audio import WHISPER_SAMPLE_RATE, load_audio
+from conftest import load_audio, make_wav
+from transcriber.audio import WHISPER_SAMPLE_RATE
 from transcriber.config import Settings
 from transcriber.engines import OpenAIWhisperTranscriber, TranscriptionError, build_transcriber
 

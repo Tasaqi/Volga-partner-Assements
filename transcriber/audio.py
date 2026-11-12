@@ -128,11 +128,6 @@ def _decode_blocks(path: str | Path) -> Iterator[np.ndarray]:
         raise UndecodableAudioError("Audio stream contains no samples")
 
 
-def load_audio(path: str | Path) -> np.ndarray:
-    """Decode the whole file into memory. Fine for short clips; use `iter_chunks` for long ones."""
-    return np.concatenate(list(_decode_blocks(path)))
-
-
 def _quietest_point(audio: np.ndarray, lo: int, hi: int, window: int) -> int:
     """Index of the centre of the lowest-energy window in audio[lo:hi]."""
     region = audio[lo:hi]

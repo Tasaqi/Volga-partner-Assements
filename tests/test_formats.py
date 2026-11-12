@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from transcriber.audio import WHISPER_SAMPLE_RATE, encode_audio, load_audio
+from conftest import load_audio
+from transcriber.audio import WHISPER_SAMPLE_RATE, encode_audio
 
 
 
