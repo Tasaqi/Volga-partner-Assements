@@ -7,6 +7,8 @@ per-segment timestamps for downstream use.
 |---|---|
 | Language | Python 3.12+ |
 | Web framework | FastAPI |
+| Speech-to-text | [OpenAI Whisper](https://github.com/openai/whisper) (open-source, local) or the OpenAI transcription API |
+| Audio decoding | [PyAV](https://pyav.org) (bundled FFmpeg libraries, no system `ffmpeg` needed) |
 | Package manager | [uv](https://docs.astral.sh/uv/) |
 
 ## Quick start
@@ -25,6 +27,10 @@ Interactive API docs: <http://localhost:8000/docs>
 | Variable | Default | Purpose |
 |---|---|---|
 | `MAX_UPLOAD_MB` | `500` | Reject uploads larger than this (HTTP 413) |
+| `TRANSCRIBER_ENGINE` | `local` | `local` (open-source Whisper in-process) or `openai` (hosted API) |
+| `WHISPER_MODEL` | `base` | Local model size: `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
+| `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Hosted model when `TRANSCRIBER_ENGINE=openai` |
+| `OPENAI_API_KEY` | – | Required for the `openai` engine |
 
 ## Part 1: Transcription Pipeline
 
@@ -47,3 +53,32 @@ Interactive API docs: <http://localhost:8000/docs>
   success and on every error path.
 - **Sync endpoint on purpose.** The handler is a plain `def`, so FastAPI runs it in a worker
   thread. Transcription is blocking, CPU-bound work and must not run on the event loop.
+
+### 2. Transcribe spoken language into text
+
+```json
+{"filename": "speech.wav", "engine": "local", "language": "en",
+ "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny."}
+```
+
+**Decisions**
+
+- **Whisper, not a custom model.** It is multilingual, robust to noise and accents, and
+  auto-detects language. Training anything here would be wasted effort.
+- **Two engines behind one `Transcriber` protocol.**
+  - `local` runs open-source Whisper in-process. No per-minute cost, and audio never
+    leaves the machine (important for sensitive recordings). The cost is CPU/GPU and
+    model memory (`base` is ~140 MB; `large-v3` needs a GPU to be practical).
+  - `openai` calls the hosted API. No GPU to run and fast on large models, but it costs per
+    minute, sends audio to a third party, and caps uploads at 25 MB (handled in Q5).
+  - The API layer only knows the protocol, so switching is one env var. Tests inject a fake
+    engine through FastAPI's dependency overrides.
+- **Load the model once per process, at startup** (FastAPI lifespan + `lru_cache`). Loading
+  takes seconds; per request it would dominate latency, and lazily the first user pays it.
+- **Serialise local inference with a lock.** One model is shared by every request thread.
+  PyTorch inference on a shared module is not guaranteed thread-safe, and parallel runs
+  would multiply peak memory. To get throughput, scale out with more processes/replicas.
+- **fp16 only on GPU.** On CPU Whisper falls back to fp32 anyway; setting it explicitly
+  avoids a warning on every call.
+- **Upstream failures are `502`**, not `500`: the request was valid, a dependency failed.
+- **Bad config fails at startup** (unknown engine, missing API key), not on a user request.

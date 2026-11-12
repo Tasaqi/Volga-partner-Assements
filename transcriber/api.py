@@ -1,24 +1,38 @@
 """HTTP service: POST an audio file to /transcribe."""
 
 import tempfile
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from transcriber.audio import AudioError, save_upload
 from transcriber.config import settings
+from transcriber.engines import Transcriber, TranscriptionError, get_transcriber
 
-app = FastAPI(title="Transcription Pipeline", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    # Load the engine before accepting traffic: bad config fails the deploy, not a user
+    # request, and the first caller does not pay the model-load latency.
+    get_transcriber()
+    yield
 
 
-class UploadAccepted(BaseModel):
+app = FastAPI(title="Transcription Pipeline", version="0.1.0", lifespan=lifespan)
+
+
+class TranscriptionResponse(BaseModel):
     filename: str
-    size_bytes: int
+    engine: str
+    language: str | None
+    text: str
 
 
 @app.exception_handler(AudioError)
-def audio_error_handler(_: Request, exc: AudioError) -> JSONResponse:
+@app.exception_handler(TranscriptionError)
+def pipeline_error_handler(_: Request, exc: AudioError | TranscriptionError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
@@ -28,9 +42,15 @@ def health() -> dict:
 
 
 # Plain `def` (not `async def`): FastAPI runs it in a worker thread, so blocking file I/O
-# and, later, CPU-bound transcription do not stall the event loop.
-@app.post("/transcribe", response_model=UploadAccepted)
-def transcribe(file: UploadFile = File(...)) -> UploadAccepted:
+# and CPU-bound transcription do not stall the event loop.
+@app.post("/transcribe", response_model=TranscriptionResponse)
+def transcribe(
+    file: UploadFile = File(...),
+    transcriber: Transcriber = Depends(get_transcriber),
+) -> TranscriptionResponse:
     with tempfile.TemporaryDirectory() as tmp:
         path = save_upload(file.file, file.filename, tmp, settings.max_upload_bytes)
-        return UploadAccepted(filename=file.filename, size_bytes=path.stat().st_size)
+        result = transcriber.transcribe(path)
+    return TranscriptionResponse(
+        filename=file.filename, engine=transcriber.name, language=result.language, text=result.text
+    )

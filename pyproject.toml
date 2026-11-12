@@ -3,7 +3,11 @@ name = "volga-partner-assements"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "av>=19.0.2",
     "fastapi>=0.162.5",
+    "numpy>=2.5.4",
+    "openai>=3.49.0",
+    "openai-whisper>=20250625",
     "python-multipart>=0.0.33",
     "uvicorn>=0.54.0",
 ]

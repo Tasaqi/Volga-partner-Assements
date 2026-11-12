@@ -4,7 +4,11 @@ import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
+import av
+import numpy as np
+
 SUPPORTED_EXTENSIONS = {".wav", ".mp3"}
+WHISPER_SAMPLE_RATE = 16_000
 COPY_CHUNK_BYTES = 1024 * 1024
 
 
@@ -54,3 +58,19 @@ def save_upload(stream: BinaryIO, filename: str, dest_dir: str | Path, max_bytes
     if written == 0:
         raise EmptyFileError("Uploaded file is empty")
     return Path(tmp)
+
+
+def load_audio(path: str | Path) -> np.ndarray:
+    """Decode any container/codec to the 16 kHz mono float32 PCM that Whisper expects.
+
+    PyAV bundles the FFmpeg libraries, so there is no dependency on a system `ffmpeg` binary.
+    """
+    with av.open(str(path)) as container:
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=WHISPER_SAMPLE_RATE)
+        frames = []
+        for frame in container.decode(audio=0):
+            frames.extend(f.to_ndarray() for f in resampler.resample(frame))
+        frames.extend(f.to_ndarray() for f in resampler.resample(None))  # flush
+    if not frames:
+        return np.zeros(0, dtype=np.float32)
+    return np.concatenate(frames, axis=1).ravel().astype(np.float32) / 32768.0

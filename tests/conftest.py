@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from transcriber.api import app
+from transcriber.engines import Transcription, get_transcriber
 
 
 def make_wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> bytes:
@@ -21,6 +22,26 @@ def make_wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> byte
     return buf.getvalue()
 
 
+class FakeTranscriber:
+    """Mock engine: tests never download a model or call the network."""
+
+    name = "fake"
+
+    def __init__(self):
+        self.calls = []
+
+    def transcribe(self, audio_path):
+        self.calls.append(audio_path)
+        return Transcription(text="hello world", language="en")
+
+
 @pytest.fixture
-def client():
-    return TestClient(app)
+def fake():
+    return FakeTranscriber()
+
+
+@pytest.fixture
+def client(fake):
+    app.dependency_overrides[get_transcriber] = lambda: fake
+    yield TestClient(app)
+    app.dependency_overrides.clear()

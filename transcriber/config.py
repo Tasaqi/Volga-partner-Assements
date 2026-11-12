@@ -4,13 +4,17 @@ import os
 from dataclasses import dataclass, field
 
 
-def _env_int(name: str, default: int) -> int:
-    return int(os.getenv(name, default))
+def _env(name: str, default: str) -> str:
+    return os.getenv(name, default)
 
 
 @dataclass(frozen=True)
 class Settings:
-    max_upload_mb: int = field(default_factory=lambda: _env_int("MAX_UPLOAD_MB", 500))
+    max_upload_mb: int = field(default_factory=lambda: int(_env("MAX_UPLOAD_MB", "500")))
+    # "local" runs open-source Whisper in-process; "openai" calls the hosted Whisper API.
+    engine: str = field(default_factory=lambda: _env("TRANSCRIBER_ENGINE", "local"))
+    whisper_model: str = field(default_factory=lambda: _env("WHISPER_MODEL", "base"))
+    openai_model: str = field(default_factory=lambda: _env("OPENAI_TRANSCRIBE_MODEL", "whisper-1"))
 
     @property
     def max_upload_bytes(self) -> int:
