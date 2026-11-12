@@ -193,3 +193,24 @@ def test_jobs_cancelled_at_shutdown_delete_their_uploads(cfg, make_gapped, monke
         assert len(list(uploads.glob("tp-upload-*"))) == 1
     finally:
         release.set()
+
+
+def _wait_for_job(client, job_id: str, timeout_s: float = 30):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        r = client.get(f"/transcriptions/{job_id}")
+        if r.headers["content-type"].startswith("application/json") and r.json().get("status") in {"queued", "running"}:
+            time.sleep(0.05)
+            continue
+        return r
+    pytest.fail("job did not finish")
+
+
+def test_header_that_understates_length_becomes_a_job(client, tmp_path):
+    from tests.test_pipeline import lying_mp3
+
+    src = lying_mp3(tmp_path)  # header says ~8 s (under the 10 s sync limit), decodes to ~125 s
+    r = post(client, src)
+    assert r.status_code == 202  # not a 2-minute transcription inside the HTTP request
+    done = _wait_for_job(client, r.json()["job_id"]).json()
+    assert done["duration"] > 100 and done["segments"][-1]["end"] > 100

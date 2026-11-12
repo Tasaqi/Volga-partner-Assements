@@ -12,6 +12,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
@@ -214,25 +215,31 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
             info = pipeline.inspect(path, cfg)  # ffprobe content check (415), max duration (413)
             filename = file.filename or "upload"
 
-            if info.duration > cfg.sync_max_duration_s:
-                job = jobs.create(filename, format)
-                future = executor.submit(run_job, job, path, workdir, language, info)
-                handed_off = True  # the job now owns workdir and deletes it
-                # A job cancelled at shutdown never runs, so its own cleanup never runs either.
-                future.add_done_callback(
-                    lambda f: f.cancelled() and shutil.rmtree(workdir, ignore_errors=True)
-                )
-                location = f"/transcriptions/{job.job_id}"
-                return JSONResponse(
-                    {"job_id": job.job_id, "status": job.status.value, "status_url": location},
-                    status_code=202,
-                    headers={"Location": location},
-                )
+            if info.duration <= cfg.sync_max_duration_s:
+                # The header can understate the length, so decode at most the sync limit here:
+                # a file that turns out longer becomes a background job, not a long request.
+                sync_cfg = replace(cfg, max_duration_s=cfg.sync_max_duration_s)
+                try:
+                    result = pipeline.transcribe_file(
+                        path, sync_cfg, engine, language=language, filename=filename, info=info
+                    )
+                    return _respond(result, format)
+                except AudioTooLongError:
+                    pass
 
-            result = pipeline.transcribe_file(
-                path, cfg, engine, language=language, filename=filename, info=info
+            job = jobs.create(filename, format)
+            future = executor.submit(run_job, job, path, workdir, language, info)
+            handed_off = True  # the job now owns workdir and deletes it
+            # A job cancelled at shutdown never runs, so its own cleanup never runs either.
+            future.add_done_callback(
+                lambda f: f.cancelled() and shutil.rmtree(workdir, ignore_errors=True)
             )
-            return _respond(result, format)
+            location = f"/transcriptions/{job.job_id}"
+            return JSONResponse(
+                {"job_id": job.job_id, "status": job.status.value, "status_url": location},
+                status_code=202,
+                headers={"Location": location},
+            )
         finally:
             if not handed_off:
                 shutil.rmtree(workdir, ignore_errors=True)
