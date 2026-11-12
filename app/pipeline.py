@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from app import audio
@@ -92,15 +92,15 @@ def transcribe_file(
         lock = threading.Lock()
         done = 0
 
-        def run_chunk(chunk: Chunk) -> EngineResult:
+        def run_chunk(chunk: Chunk, lang: str | None) -> EngineResult:
             nonlocal done
             if len(chunks) == 1:
-                result = engine.transcribe(wav, language)
+                result = engine.transcribe(wav, lang)
             else:
                 part = audio.extract(wav, chunk.cut_start, chunk.cut_end,
                                      Path(tmp) / f"chunk-{chunk.index:04d}.wav")
                 try:
-                    result = engine.transcribe(part, language)
+                    result = engine.transcribe(part, lang)
                 finally:
                     part.unlink(missing_ok=True)  # bounded disk use on long files
             with lock:
@@ -109,8 +109,28 @@ def transcribe_file(
                     progress(done / len(chunks))
             return result
 
+        # Without a requested language, transcribe chunks one by one until one contains
+        # speech, then pin its language for the rest. Otherwise each chunk would detect
+        # on its own, and a noisy chunk of an English file could come out as Japanese.
+        results: dict[int, EngineResult] = {}
+        for chunk in chunks:
+            if language:
+                break
+            results[chunk.index] = first = run_chunk(chunk, None)
+            if first.segments and first.language:
+                language = first.language
+
+        remaining = [c for c in chunks if c.index not in results]
         with ThreadPoolExecutor(max_workers=max(1, cfg.chunk_workers)) as pool:
-            engine_results = list(pool.map(run_chunk, chunks))  # preserves chunk order
+            futures = {c.index: pool.submit(run_chunk, c, language) for c in remaining}
+            finished, pending = wait(futures.values(), return_when=FIRST_EXCEPTION)
+            failed = next((f for f in finished if f.exception()), None)
+            if failed:
+                for f in pending:
+                    f.cancel()  # don't spend CPU or paid API minutes on a file that already failed
+                raise failed.exception()  # type: ignore[misc]
+        results.update({i: f.result() for i, f in futures.items()})
+        engine_results = [results[c.index] for c in chunks]
 
     raw = merge_chunks([(c, r.segments) for c, r in zip(chunks, engine_results)])
     segments = finalize_segments(raw)

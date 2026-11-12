@@ -43,6 +43,18 @@ class Settings:
     silence_min_s: float = 0.5
     chunk_workers: int = 1
 
+    def __post_init__(self) -> None:
+        # Fail at startup with a clear message: e.g. chunk_seconds=0 would make
+        # chunk planning loop forever, and workers=0 would deadlock the pool.
+        positive = ("max_upload_mb", "max_duration_s", "chunk_seconds", "job_workers",
+                    "chunk_workers", "silence_min_s")
+        non_negative = ("sync_max_duration_s", "silence_search_s", "chunk_overlap_s",
+                        "fallback_cooldown_s")
+        bad = [f"TP_{n.upper()} must be > 0" for n in positive if getattr(self, n) <= 0]
+        bad += [f"TP_{n.upper()} must be >= 0" for n in non_negative if getattr(self, n) < 0]
+        if bad:
+            raise ValueError("Invalid settings: " + "; ".join(bad))
+
     @property
     def max_upload_bytes(self) -> int:
         return self.max_upload_mb * 1024 * 1024
@@ -52,8 +64,8 @@ class Settings:
         """Build settings from ``TP_<FIELD_NAME>`` env vars; ``overrides`` win."""
         values: dict[str, object] = {}
         for f in dataclasses.fields(cls):
-            raw = os.environ.get(f"TP_{f.name.upper()}")
-            if raw is not None:
+            raw = os.environ.get(f"TP_{f.name.upper()}", "").strip()
+            if raw:  # empty means "use the default", e.g. a blank line kept in .env
                 cast = type(f.default)  # every field has a typed default
                 values[f.name] = cast(raw)
         values.update(overrides)

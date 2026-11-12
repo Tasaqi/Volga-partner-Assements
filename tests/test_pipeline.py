@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from app.audio import AudioTooLongError
-from app.engines import EngineResult, MockEngine
+from app.engines import EngineResult, MockEngine, TranscriptionError
 from app.pipeline import transcribe_file
 
 LONG = dict(chunk_seconds=10.0, silence_search_s=3.0, chunk_overlap_s=1.0)
@@ -74,5 +74,35 @@ def test_parallel_chunks_run_concurrently(make_gapped, cfg):
 
     wav = make_gapped(seconds=18, period=10, on=8)  # one gap -> exactly 2 chunks
     cfg = replace(cfg, chunk_workers=2, chunk_seconds=10.0, silence_search_s=3.0)
-    result = transcribe_file(wav, cfg, Concurrent())
+    result = transcribe_file(wav, cfg, Concurrent(), language="en")  # known language: all parallel
     assert result.metadata.chunks == 2
+
+
+def test_language_from_first_speech_chunk_is_pinned_for_the_rest(make_gapped, cfg):
+    class Detects(MockEngine):
+        def __init__(self):
+            self.seen = []
+
+        def transcribe(self, wav_path, language=None):
+            self.seen.append(language)
+            return replace(super().transcribe(wav_path, language), language=language or "fr")
+
+    engine = Detects()
+    result = transcribe_file(make_gapped(seconds=30), replace(cfg, **LONG), engine)
+    assert engine.seen[0] is None  # first chunk auto-detects...
+    assert set(engine.seen[1:]) == {"fr"}  # ...and every later chunk reuses its answer
+    assert result.language == "fr"
+
+
+def test_failed_chunk_stops_the_remaining_chunks(make_gapped, cfg):
+    class Down(MockEngine):
+        calls = 0
+
+        def transcribe(self, wav_path, language=None):
+            Down.calls += 1
+            raise TranscriptionError("both engines down")
+
+    with pytest.raises(TranscriptionError):
+        transcribe_file(make_gapped(seconds=30), replace(cfg, **LONG), Down(), language="en")
+    # 4 chunks planned; a worker may already have picked up one more before the cancel
+    assert Down.calls <= 2

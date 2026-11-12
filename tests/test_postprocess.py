@@ -30,6 +30,11 @@ SEGS = [
 ]
 
 
+def test_segment_has_readable_timeframe():
+    assert SEGS[1].timeframe == "01:01:01.250 --> 01:01:03.000"
+    assert SEGS[1].model_dump()["timeframe"] == SEGS[1].timeframe  # included in JSON
+
+
 def test_srt_format():
     assert to_srt(SEGS) == (
         "1\n00:00:00,000 --> 00:00:02,500\nfirst\n\n"

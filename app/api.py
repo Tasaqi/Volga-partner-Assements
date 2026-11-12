@@ -14,17 +14,20 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app import pipeline
 from app.audio import AudioError, AudioInfo, AudioTooLongError, UnsupportedAudioError
 from app.config import Settings
 from app.engines import TranscriptionEngine, TranscriptionError, build_engine
+from app.languages import normalize_language
 from app.postprocess import MEDIA_TYPES, render
 from app.schemas import Job, JobStatus, OutputFormat, TranscriptionResult
 
 UPLOAD_PIECE = 1024 * 1024  # copy uploads in 1 MB pieces
+MULTIPART_OVERHEAD = 1024 * 1024  # room for multipart headers around the file itself
 
 ERROR_STATUS: dict[type[AudioError], int] = {
     UnsupportedAudioError: 415,
@@ -69,6 +72,57 @@ class JobStore:
             )
 
 
+class _BodyTooLarge(BaseException):
+    """BaseException on purpose: FastAPI turns any Exception raised while parsing the
+    body into a generic 400, and this must reach RequestGuard as a 413."""
+
+
+class RequestGuard:
+    """Checks the API key and upload size BEFORE the request body is read.
+
+    FastAPI parses multipart forms before it runs dependencies, so checks written as
+    dependencies only run after the whole upload is already on disk: a client without
+    a key, or with a 50 GB file, could fill the disk. This ASGI middleware rejects
+    early on headers and counts body bytes as they arrive (covers chunked uploads too).
+    """
+
+    def __init__(self, app: ASGIApp, api_key: str, max_body_bytes: int):
+        self.app, self.api_key, self.max_body_bytes = app, api_key, max_body_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not scope["path"].startswith("/transcriptions"):
+            return await self.app(scope, receive, send)
+
+        headers = {k.decode().lower(): v.decode() for k, v in scope["headers"]}
+        given = headers.get("x-api-key", "")
+        if self.api_key and not secrets.compare_digest(given.encode(), self.api_key.encode()):
+            return await _reject(scope, receive, send, 401, "Invalid or missing X-API-Key")
+        if int(headers.get("content-length") or 0) > self.max_body_bytes:
+            return await _reject(scope, receive, send, 413, self._too_large())
+
+        received = 0
+
+        async def counting_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            received += len(message.get("body", b""))
+            if received > self.max_body_bytes:
+                raise _BodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, counting_receive, send)
+        except _BodyTooLarge:
+            await _reject(scope, receive, send, 413, self._too_large())
+
+    def _too_large(self) -> str:
+        return f"Upload exceeds {(self.max_body_bytes - MULTIPART_OVERHEAD) // (1024 * 1024)} MB"
+
+
+async def _reject(scope: Scope, receive: Receive, send: Send, status: int, detail: str) -> None:
+    await JSONResponse({"detail": detail}, status_code=status)(scope, receive, send)
+
+
 def _save_upload(upload: UploadFile, dest_dir: Path, max_bytes: int) -> Path:
     """Stream the upload to disk in 1 MB pieces, enforcing the size limit on real bytes.
 
@@ -103,11 +157,9 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
         yield
         executor.shutdown(wait=False, cancel_futures=True)
 
-    def require_api_key(x_api_key: str | None = Header(None)) -> None:
-        if cfg.api_key and not secrets.compare_digest((x_api_key or "").encode(), cfg.api_key.encode()):
-            raise HTTPException(401, "Invalid or missing X-API-Key")
-
     app = FastAPI(title="Transcription Pipeline", version="1.0.0", lifespan=lifespan)
+    app.add_middleware(RequestGuard, api_key=cfg.api_key,
+                       max_body_bytes=cfg.max_upload_bytes + MULTIPART_OVERHEAD)
 
     @app.exception_handler(AudioError)
     async def audio_error(_: Request, exc: AudioError) -> JSONResponse:
@@ -145,13 +197,16 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
     @app.post(
         "/transcriptions",
         responses={202: {"description": "Long file accepted as a background job"}},
-        dependencies=[Depends(require_api_key)],
     )
     def create_transcription(
         file: UploadFile,
-        language: str | None = Query(None, description='ISO code, e.g. "en"; auto-detect if omitted'),
+        language: str | None = Query(None, description='"en" or "english"; auto-detect if omitted'),
         format: OutputFormat = Query(OutputFormat.json),
     ) -> Response:
+        try:
+            language = normalize_language(language) if language else None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
         workdir = Path(tempfile.mkdtemp(prefix="tp-upload-"))
         handed_off = False
         try:
@@ -161,8 +216,12 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
 
             if info.duration > cfg.sync_max_duration_s:
                 job = jobs.create(filename, format)
-                executor.submit(run_job, job, path, workdir, language, info)
+                future = executor.submit(run_job, job, path, workdir, language, info)
                 handed_off = True  # the job now owns workdir and deletes it
+                # A job cancelled at shutdown never runs, so its own cleanup never runs either.
+                future.add_done_callback(
+                    lambda f: f.cancelled() and shutil.rmtree(workdir, ignore_errors=True)
+                )
                 location = f"/transcriptions/{job.job_id}"
                 return JSONResponse(
                     {"job_id": job.job_id, "status": job.status.value, "status_url": location},
@@ -178,7 +237,7 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
             if not handed_off:
                 shutil.rmtree(workdir, ignore_errors=True)
 
-    @app.get("/transcriptions/{job_id}", dependencies=[Depends(require_api_key)])
+    @app.get("/transcriptions/{job_id}")
     def get_transcription(job_id: str) -> Response:
         found = jobs.get(job_id)
         if found is None:

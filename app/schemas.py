@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class OutputFormat(str, Enum):
@@ -15,12 +15,27 @@ class OutputFormat(str, Enum):
     txt = "txt"
 
 
+def format_timestamp(seconds: float, sep: str = ".") -> str:
+    """``3661.25`` -> ``01:01:01.250`` (``sep=","`` gives the SRT style)."""
+    ms = round(seconds * 1000)
+    h, ms = divmod(ms, 3_600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
+
+
 class Segment(BaseModel):
     id: int
     start: float = Field(description="Seconds from the start of the original file")
     end: float
     text: str
     confidence: float = Field(ge=0.0, le=1.0)
+
+    # Numbers stay for machines (seek, maths); this readable copy is for people.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def timeframe(self) -> str:
+        return f"{format_timestamp(self.start)} --> {format_timestamp(self.end)}"
 
 
 class Metadata(BaseModel):

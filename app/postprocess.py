@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 
 from app.engines import RawSegment
-from app.schemas import OutputFormat, Segment, TranscriptionResult
+from app.schemas import OutputFormat, Segment, TranscriptionResult, format_timestamp
 
 # Whisper hallucinates on silence/noise: high no-speech probability AND low
 # token confidence together is a strong signal (same thresholds Whisper uses).
@@ -45,33 +45,20 @@ def finalize_segments(raw: list[RawSegment]) -> list[Segment]:
     return out
 
 
-def _timestamp(seconds: float, sep: str) -> str:
-    ms = round(seconds * 1000)
-    h, ms = divmod(ms, 3_600_000)
-    m, ms = divmod(ms, 60_000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
-
-
 def to_srt(segments: list[Segment]) -> str:
     blocks = [
-        f"{s.id}\n{_timestamp(s.start, ',')} --> {_timestamp(s.end, ',')}\n{s.text}\n"
+        f"{s.id}\n{format_timestamp(s.start, ',')} --> {format_timestamp(s.end, ',')}\n{s.text}\n"
         for s in segments
     ]
     return "\n".join(blocks)
 
 
 def to_vtt(segments: list[Segment]) -> str:
-    blocks = [
-        f"{_timestamp(s.start, '.')} --> {_timestamp(s.end, '.')}\n{s.text}\n" for s in segments
-    ]
-    return "WEBVTT\n\n" + "\n".join(blocks)
+    return "WEBVTT\n\n" + "\n".join(f"{s.timeframe}\n{s.text}\n" for s in segments)
 
 
 def to_txt(segments: list[Segment]) -> str:
-    return "".join(
-        f"[{_timestamp(s.start, '.')} --> {_timestamp(s.end, '.')}] {s.text}\n" for s in segments
-    )
+    return "".join(f"[{s.timeframe}] {s.text}\n" for s in segments)
 
 
 MEDIA_TYPES = {

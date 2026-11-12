@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 import wave
 from dataclasses import dataclass, replace
@@ -33,9 +34,16 @@ log = logging.getLogger(__name__)
 class TranscriptionError(Exception):
     """The engine failed on input that passed validation (not the caller's fault)."""
 
-    def __init__(self, message: str, status_code: int = 502):
+    def __init__(self, message: str, status_code: int = 502, outage: bool = True):
         super().__init__(message)
         self.status_code = status_code  # 502: upstream API failed; 500: local engine failed
+        # True when the engine itself is unhealthy (network, 5xx, 429, auth). False when only
+        # this input was rejected: that must not switch the engine off for every other user.
+        self.outage = outage
+
+
+# The API rejected this particular request (bad parameter, file too large), not an outage.
+REQUEST_ERROR_STATUSES = frozenset({400, 413, 422})
 
 
 @dataclass(frozen=True)
@@ -75,6 +83,11 @@ def _load_whisper(model_size: str, device: str, compute_type: str) -> WhisperMod
     return WhisperModel(model_size, device=device, compute_type=compute_type)
 
 
+# lru_cache does not stop two threads computing the same key at once; without this lock,
+# parallel first requests would each load their own copy of a multi-GB model.
+_load_lock = threading.Lock()
+
+
 def _read_pcm(wav_path: Path) -> np.ndarray:
     """Canonical WAV -> float32 samples in [-1, 1].
 
@@ -97,12 +110,16 @@ class FasterWhisperEngine:
         self.model = model_size
         self._device = device
         self._compute_type = compute_type
+        self._loaded = False
 
     def _whisper(self) -> WhisperModel:
-        return _load_whisper(self.model, self._device, self._compute_type)
+        with _load_lock:
+            model = _load_whisper(self.model, self._device, self._compute_type)
+        self._loaded = True
+        return model
 
     def is_loaded(self) -> bool:
-        return _load_whisper.cache_info().currsize > 0
+        return self._loaded
 
     def transcribe(self, wav_path: Path, language: str | None = None) -> EngineResult:
         try:
@@ -158,7 +175,9 @@ class OpenAIEngine:
                     **({"language": language} if language else {}),
                 )
         except (openai.OpenAIError, audio.AudioError) as exc:
-            raise TranscriptionError(f"OpenAI transcription failed: {exc}") from exc
+            status = getattr(exc, "status_code", None)
+            outage = not isinstance(exc, audio.AudioError) and status not in REQUEST_ERROR_STATUSES
+            raise TranscriptionError(f"OpenAI transcription failed: {exc}", outage=outage) from exc
         finally:
             flac.unlink(missing_ok=True)
 
@@ -196,7 +215,8 @@ class FallbackEngine:
             try:
                 return self.primary.transcribe(wav_path, language)
             except TranscriptionError as exc:
-                self._skip_primary_until = time.monotonic() + self.cooldown_s
+                if exc.outage:  # one bad request must not switch the primary off for everyone
+                    self._skip_primary_until = time.monotonic() + self.cooldown_s
                 primary_error = str(exc)
                 log.warning("%s failed, using %s: %s", self.primary.name, self.fallback.name, exc)
         try:
@@ -245,17 +265,19 @@ def _single_engine(name: str, cfg: Settings) -> TranscriptionEngine:
 
 
 def build_engine(cfg: Settings) -> TranscriptionEngine:
-    if cfg.engine == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        if cfg.fallback_engine in ("", "none", "openai"):
-            raise ValueError("TP_ENGINE=openai needs OPENAI_API_KEY (or a TP_FALLBACK_ENGINE)")
-        # Degrade instead of refusing to start, so the service still runs keyless/offline.
-        log.warning("OPENAI_API_KEY not set: using %s only", cfg.fallback_engine)
-        return _single_engine(cfg.fallback_engine, cfg)
-    primary = _single_engine(cfg.engine, cfg)
+    names = [cfg.engine]
     # The mock engine is for offline tests and demos, so it is never wrapped.
-    if cfg.engine == "mock" or cfg.fallback_engine in ("", "none", cfg.engine):
-        return primary
-    fallback = _single_engine(cfg.fallback_engine, cfg)
-    if isinstance(fallback, FasterWhisperEngine):
-        fallback._whisper()  # load now: a broken fallback should fail at startup, not mid-outage
-    return FallbackEngine(primary, fallback, cfg.fallback_cooldown_s)
+    if cfg.engine != "mock" and cfg.fallback_engine not in ("", "none", cfg.engine):
+        names.append(cfg.fallback_engine)
+    if "openai" in names and not os.environ.get("OPENAI_API_KEY"):
+        # Degrade instead of refusing to start, so the service still runs keyless/offline.
+        names.remove("openai")
+        if not names:
+            raise ValueError("TP_ENGINE=openai needs OPENAI_API_KEY (or a TP_FALLBACK_ENGINE)")
+        log.warning("OPENAI_API_KEY not set: using %s only", names[0])
+
+    engines = [_single_engine(name, cfg) for name in names]
+    for e in engines:
+        if isinstance(e, FasterWhisperEngine):
+            e._whisper()  # load now: a broken model should fail at startup, not mid-request
+    return engines[0] if len(engines) == 1 else FallbackEngine(*engines, cfg.fallback_cooldown_s)

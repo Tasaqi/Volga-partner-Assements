@@ -30,3 +30,18 @@ TO_LANGUAGE_CODE: dict[str, str] = {
     "letzeburgesch": "lb", "pushto": "ps", "panjabi": "pa", "moldavian": "ro",
     "moldovan": "ro", "sinhalese": "si", "castilian": "es", "mandarin": "zh",
 }
+
+LANGUAGE_CODES = frozenset(TO_LANGUAGE_CODE.values())
+
+
+def normalize_language(value: str) -> str:
+    """``"en"``, ``"EN"`` or ``"english"`` -> ``"en"``. Raises ValueError if unknown.
+
+    Checked at the API boundary: an unknown code would otherwise reach the engines
+    and fail deep inside them (OpenAI: 400, faster-whisper: ValueError).
+    """
+    key = value.strip().lower()
+    code = TO_LANGUAGE_CODE.get(key, key)
+    if code not in LANGUAGE_CODES:
+        raise ValueError(f"Unknown language {value!r}; use an ISO 639-1 code such as 'en'")
+    return code
