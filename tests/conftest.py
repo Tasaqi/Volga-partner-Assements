@@ -7,7 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from transcriber.api import app
-from transcriber.engines import Transcription, get_transcriber
+from transcriber.engines import Segment, Transcription, get_transcriber
 
 
 def make_wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> bytes:
@@ -32,7 +32,12 @@ class FakeTranscriber:
 
     def transcribe(self, audio_path):
         self.calls.append(audio_path)
-        return Transcription(text="hello world", language="en")
+        return Transcription(
+            text="hello world",
+            language="en",
+            duration=2.0,
+            segments=[Segment(0.0, 1.0, "hello"), Segment(1.0, 2.0, "world")],
+        )
 
 
 @pytest.fixture

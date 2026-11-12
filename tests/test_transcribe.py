@@ -12,7 +12,9 @@ from transcriber.engines import OpenAIWhisperTranscriber, TranscriptionError, bu
 def test_returns_transcribed_text(client, fake):
     r = client.post("/transcribe", files={"file": ("clip.wav", make_wav())})
     assert r.status_code == 200
-    assert r.json() == {"filename": "clip.wav", "engine": "fake", "language": "en", "text": "hello world"}
+    body = r.json()
+    assert (body["filename"], body["engine"], body["language"]) == ("clip.wav", "fake", "en")
+    assert body["text"] == "hello world"
     assert len(fake.calls) == 1
 
 
@@ -40,7 +42,12 @@ class StubClient:
         self.kwargs = kwargs
         if self.error:
             raise self.error
-        return SimpleNamespace(text=" hi there ", language="english")
+        return SimpleNamespace(
+            text=" hi there ",
+            language="english",
+            duration=1.23456,
+            segments=[SimpleNamespace(start=0.0, end=1.23456, text=" hi there ")],
+        )
 
 
 def test_openai_engine_requests_verbose_json(tmp_path):
@@ -49,8 +56,10 @@ def test_openai_engine_requests_verbose_json(tmp_path):
     stub = StubClient()
     result = OpenAIWhisperTranscriber("whisper-1", client=stub).transcribe(path)
     assert result.text == "hi there"
+    assert result.language == "en"
     assert stub.kwargs["model"] == "whisper-1"
     assert stub.kwargs["response_format"] == "verbose_json"
+    assert result.segments[0].end == 1.235 and result.segments[0].text == "hi there"
 
 
 def test_openai_engine_maps_upstream_errors(tmp_path):

@@ -56,10 +56,7 @@ Interactive API docs: <http://localhost:8000/docs>
 
 ### 2. Transcribe spoken language into text
 
-```json
-{"filename": "speech.wav", "engine": "local", "language": "en",
- "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny."}
-```
+Response shape is shown in Q3.
 
 **Decisions**
 
@@ -82,3 +79,36 @@ Interactive API docs: <http://localhost:8000/docs>
   avoids a warning on every call.
 - **Upstream failures are `502`**, not `500`: the request was valid, a dependency failed.
 - **Bad config fails at startup** (unknown engine, missing API key), not on a user request.
+
+### 3. Return the transcription with timestamps per segment
+
+```json
+{
+  "filename": "speech.wav",
+  "engine": "local",
+  "language": "en",
+  "duration": 4.942,
+  "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny.",
+  "segments": [
+    {"start": 0.0, "end": 4.76, "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny."}
+  ]
+}
+```
+
+**Decisions**
+
+- **Segments are Whisper's own phrase-level segments** (`start`/`end` in seconds). They map
+  directly to subtitles (SRT/VTT), search-and-seek in a player, or chunking for an LLM.
+  Word-level timestamps are possible but cost extra compute and bloat the payload; not
+  needed by anything here.
+- **One schema regardless of engine.** Both engines map into the same `Segment` /
+  `Transcription` dataclasses; the hosted API needs `response_format="verbose_json"` to
+  return segments at all. Language is normalised to ISO 639-1 (`en`), because the hosted API
+  returns `english` while local Whisper returns `en`. Downstream code should not care which
+  engine ran.
+- **Millisecond rounding.** Floats like `4.7600000000000001` are noise; subtitle formats
+  use milliseconds.
+- **`duration` is returned** so a consumer can check coverage (last segment end vs. audio
+  length) and compute real-time factor without decoding the file again.
+- **Typed response model** (`TranscriptionResponse`), so the contract is enforced and shows
+  up in the OpenAPI docs at `/docs`.

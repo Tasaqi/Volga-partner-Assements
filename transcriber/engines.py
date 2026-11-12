@@ -5,12 +5,12 @@ configuration and tests can inject a fake without touching a real model or netwo
 """
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from transcriber.audio import load_audio
+from transcriber.audio import WHISPER_SAMPLE_RATE, load_audio
 from transcriber.config import Settings, settings
 
 
@@ -21,9 +21,30 @@ class TranscriptionError(Exception):
 
 
 @dataclass
+class Segment:
+    start: float  # seconds from the start of the audio
+    end: float
+    text: str
+
+
+@dataclass
 class Transcription:
     text: str
     language: str | None
+    duration: float
+    segments: list[Segment] = field(default_factory=list)
+
+
+def _segment(start: float, end: float, text: str) -> Segment:
+    # Millisecond precision is what subtitle formats use; more digits are noise.
+    return Segment(start=round(start, 3), end=round(end, 3), text=text.strip())
+
+
+def _language_code(name: str | None) -> str | None:
+    """The hosted API returns 'english'; local Whisper returns 'en'. Normalise to ISO 639-1."""
+    from whisper.tokenizer import TO_LANGUAGE_CODE
+
+    return TO_LANGUAGE_CODE.get(name.lower(), name) if name else None
 
 
 class Transcriber(Protocol):
@@ -51,7 +72,12 @@ class LocalWhisperTranscriber:
         audio = load_audio(audio_path)
         with self._lock:
             result = self._model.transcribe(audio, fp16=self._fp16)
-        return Transcription(text=result["text"].strip(), language=result.get("language"))
+        return Transcription(
+            text=result["text"].strip(),
+            language=result.get("language"),
+            duration=round(len(audio) / WHISPER_SAMPLE_RATE, 3),
+            segments=[_segment(s["start"], s["end"], s["text"]) for s in result["segments"]],
+        )
 
 
 class OpenAIWhisperTranscriber:
@@ -73,11 +99,19 @@ class OpenAIWhisperTranscriber:
         try:
             with open(audio_path, "rb") as f:
                 result = self._client.audio.transcriptions.create(
-                    model=self._model, file=f, response_format="verbose_json"
+                    model=self._model,
+                    file=f,
+                    response_format="verbose_json",  # the only format that returns segments
+                    timestamp_granularities=["segment"],
                 )
         except openai.OpenAIError as e:
             raise TranscriptionError(f"Upstream transcription failed: {e}") from e
-        return Transcription(text=result.text.strip(), language=getattr(result, "language", None))
+        return Transcription(
+            text=result.text.strip(),
+            language=_language_code(getattr(result, "language", None)),
+            duration=round(result.duration, 3),
+            segments=[_segment(s.start, s.end, s.text) for s in result.segments or []],
+        )
 
 
 def build_transcriber(cfg: Settings) -> Transcriber:

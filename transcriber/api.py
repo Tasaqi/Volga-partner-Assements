@@ -1,6 +1,7 @@
 """HTTP service: POST an audio file to /transcribe."""
 
 import tempfile
+from dataclasses import asdict
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Request, UploadFile
@@ -9,7 +10,7 @@ from pydantic import BaseModel
 
 from transcriber.audio import AudioError, save_upload
 from transcriber.config import settings
-from transcriber.engines import Transcriber, TranscriptionError, get_transcriber
+from transcriber.engines import Segment, Transcriber, TranscriptionError, get_transcriber
 
 
 @asynccontextmanager
@@ -27,7 +28,9 @@ class TranscriptionResponse(BaseModel):
     filename: str
     engine: str
     language: str | None
+    duration: float
     text: str
+    segments: list[Segment]
 
 
 @app.exception_handler(AudioError)
@@ -51,6 +54,4 @@ def transcribe(
     with tempfile.TemporaryDirectory() as tmp:
         path = save_upload(file.file, file.filename, tmp, settings.max_upload_bytes)
         result = transcriber.transcribe(path)
-    return TranscriptionResponse(
-        filename=file.filename, engine=transcriber.name, language=result.language, text=result.text
-    )
+    return TranscriptionResponse(filename=file.filename, engine=transcriber.name, **asdict(result))
