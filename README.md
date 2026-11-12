@@ -1,237 +1,256 @@
-# Volga Partner Assessments – Transcription Pipeline
+# Transcription Pipeline
 
-An HTTP service that accepts an audio file, transcribes it, and returns the text with
-per-segment timestamps for downstream use.
+A speech-to-text service you can run two ways: as an HTTP API (FastAPI) or from the command line. Send it an audio or video file in any common format, of any length up to 4 hours. It returns a transcript with absolute timestamps for every segment, as JSON, SRT, VTT or plain text.
+
+Transcription uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper), the open-source Whisper model running on CTranslate2. No model is trained here. All decoding, probing and silence detection go through `ffmpeg` and `ffprobe`.
 
 | | |
 |---|---|
-| Language | Python 3.12+ |
-| Web framework | FastAPI |
-| Speech-to-text | [OpenAI Whisper](https://github.com/openai/whisper) (open-source, local) or the OpenAI transcription API |
-| Audio decoding | [PyAV](https://pyav.org) (bundled FFmpeg libraries, no system `ffmpeg` needed) |
-| Package manager | [uv](https://docs.astral.sh/uv/) |
+| Runtime | Python 3.11+, FastAPI, Uvicorn, Pydantic v2 |
+| Speech-to-text | faster-whisper (`int8`, VAD on, beam 5) |
+| Audio | ffmpeg / ffprobe via `subprocess` |
+| Tests | pytest + httpx. Fixtures are generated with ffmpeg `lavfi`, so the repo holds no binary files |
+
+---
 
 ## Quick start
 
-```bash
-uv sync
-uv run pytest
-uv run uvicorn transcriber.api:app --reload
-curl -F "file=@sample.wav" http://localhost:8000/transcribe
+Requires `ffmpeg` on `PATH` (`brew install ffmpeg` / `apt-get install ffmpeg`).
 
-# long files: stream segments as they are produced (NDJSON)
-curl -N -F "file=@podcast.mp3" "http://localhost:8000/transcribe?stream=true"
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
 ```
 
-Interactive API docs: <http://localhost:8000/docs>
+### CLI
 
-## Configuration
+```bash
+python cli.py input.mp3 --format srt -o out.srt --model base --language en
+python cli.py lecture.mp4                       # JSON to stdout, language auto-detected
+python cli.py input.wav --engine mock           # offline demo, no model download
+```
 
-| Variable | Default | Purpose |
+Progress is printed to stderr. Exit code `2` means the input was rejected (not audio, too long).
+
+### API
+
+```bash
+uvicorn app.api:create_app --factory --port 8000
+
+curl -F "file=@meeting.m4a" "localhost:8000/transcriptions?language=en"
+curl -F "file=@meeting.m4a" "localhost:8000/transcriptions?format=srt"
+
+# files longer than 120 s are accepted as a background job (202 + Location header)
+curl -i -F "file=@podcast.mp3" localhost:8000/transcriptions
+curl localhost:8000/transcriptions/<job_id>
+```
+
+Interactive docs: <http://localhost:8000/docs>
+
+### Docker
+
+```bash
+docker build -t transcription-pipeline .                          # bakes in the "base" model
+docker build --build-arg MODEL_SIZE=small -t transcription-pipeline .
+docker run -p 8000:8000 transcription-pipeline
+```
+
+The model is downloaded while the image builds, and the container runs with `HF_HUB_OFFLINE=1`, so it starts without network access. Without that setting, every cold start checks Hugging Face Hub, which added more than a minute in testing.
+
+### Tests
+
+```bash
+pytest -q
+```
+
+The tests use `MockEngine`, so they never download a model. They take about 5 seconds.
+
+---
+
+## API
+
+| Method | Path | Description |
 |---|---|---|
-| `MAX_UPLOAD_MB` | `500` | Reject uploads larger than this (HTTP 413) |
-| `TRANSCRIBER_ENGINE` | `local` | `local` (open-source Whisper in-process) or `openai` (hosted API) |
-| `TRANSCRIBER_FALLBACK` | `local` | Engine used when the primary fails; `none` disables |
-| `WHISPER_MODEL` | `base` | Local model size: `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
-| `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Hosted model when `TRANSCRIBER_ENGINE=openai` |
-| `OPENAI_API_KEY` | – | Required for the `openai` engine |
-| `CHUNK_SECONDS` | `600` | Target chunk length for long audio |
-| `MAX_AUDIO_MINUTES` | `180` | Reject longer audio (HTTP 413), checked before transcription |
+| `POST` | `/transcriptions` | Multipart `file` upload. Query parameters: `language` (e.g. `en`, auto-detected if omitted) and `format` (`json` \| `srt` \| `vtt` \| `txt`, default `json`). Returns **200** with the transcript, or **202** with `{job_id, status, status_url}` and a `Location` header when the audio is longer than `TP_SYNC_MAX_DURATION_S`. |
+| `GET` | `/transcriptions/{job_id}` | While the job is queued or running: `{job_id, status, progress (0-1), filename, format, error, created_at}`. Once complete: the transcript in the format requested at upload. **404** if the job ID is unknown. |
+| `GET` | `/health` | `{status, engine, model, model_loaded}` |
 
-## Part 1: Transcription Pipeline
+| Status | When |
+|---|---|
+| 400 | Empty upload |
+| 413 | Upload larger than `TP_MAX_UPLOAD_MB`, or audio longer than `TP_MAX_DURATION_S` |
+| 415 | Not decodable audio: a corrupt file, a non-media file with an audio extension, or a video with no audio track |
+| 422 | Invalid query parameter, e.g. `format=docx` |
 
-### 1. Accept an audio file (WAV or MP3)
+A failed job returns `status: "failed"` with an `error` message.
 
-WAV and MP3 are accepted, along with every format in Q4.
-
-`POST /transcribe` takes a `multipart/form-data` upload in the `file` field.
-
-**Decisions**
-
-- **Stream to disk, don't buffer.** The upload is copied to a per-request temp directory
-  in 1 MB chunks and aborted the moment it crosses `MAX_UPLOAD_MB`. A 2 GB upload never sits
-  in memory, and the limit is enforced on actual bytes, not on a `Content-Length` header the
-  client controls.
-- **Never trust the client filename.** Only its extension is kept; the on-disk name is
-  generated by `mkstemp`, so `../../etc/passwd.wav` cannot escape the temp directory.
-- **Meaningful status codes.** `415` unsupported type, `413` too large, `400` empty file.
-  Errors are typed exceptions (`AudioError` subclasses) mapped to HTTP in one handler, so
-  the pipeline code stays free of web concerns.
-- **Cleanup is structural.** The temp directory is a context manager; it is removed on
-  success and on every error path.
-- **Sync endpoint on purpose.** The handler is a plain `def`, so FastAPI runs it in a worker
-  thread. Transcription is blocking, CPU-bound work and must not run on the event loop.
-
-### 2. Transcribe spoken language into text
-
-Response shape is shown in Q3.
-
-**Decisions**
-
-- **Whisper, not a custom model.** It is multilingual, robust to noise and accents, and
-  auto-detects language. Training anything here would be wasted effort.
-- **Two engines behind one `Transcriber` protocol.**
-  - `local` runs open-source Whisper in-process. No per-minute cost, and audio never
-    leaves the machine (important for sensitive recordings). The cost is CPU/GPU and
-    model memory (`base` is ~140 MB; `large-v3` needs a GPU to be practical).
-  - `openai` calls the hosted API. No GPU to run and fast on large models, but it costs per
-    minute, sends audio to a third party, and caps uploads at 25 MB (handled in Q5).
-  - The API layer only knows the protocol, so switching is one env var. Tests inject a fake
-    engine through FastAPI's dependency overrides.
-- **Automatic fallback between engines.** With `TRANSCRIBER_ENGINE=openai` the service
-  falls back to open-source Whisper by default (`TRANSCRIBER_FALLBACK=local`), so an OpenAI
-  outage, rate limit or revoked key degrades the service instead of failing it. It works in
-  both directions (`local` primary with `openai` fallback covers e.g. GPU out-of-memory).
-  - **Retry first, then fall back.** The OpenAI SDK already retries 429/5xx/connection errors
-    with exponential backoff (`max_retries=2`, `timeout=120s`). The fallback runs only once
-    those are exhausted.
-  - **Per chunk, not per file.** On long audio only the chunks that failed are re-done on
-    the fallback, with the same prompt and language context.
-  - **Circuit breaker.** After a failure the primary is skipped for 60 s, so during an outage
-    each chunk does not first wait out retries and timeouts. Verified by simulating an outage:
-    a 35 s file in two chunks logged one failure and returned `200` from local Whisper in 3 s.
-  - **Visible, not silent.** The response's `engine` is `openai+local` and every fallback logs
-    a warning with the cause. If both engines fail, the error contains both reasons.
-  - **The fallback is loaded at startup.** That costs memory even when it is never used, but a
-    broken fallback fails the deploy instead of being discovered in the middle of an outage.
-- **Load the model once per process, at startup** (FastAPI lifespan + `lru_cache`). Loading
-  takes seconds; per request it would dominate latency, and lazily the first user pays it.
-- **Serialise local inference with a lock.** One model is shared by every request thread.
-  PyTorch inference on a shared module is not guaranteed thread-safe, and parallel runs
-  would multiply peak memory. To get throughput, scale out with more processes/replicas.
-- **fp16 only on GPU.** On CPU Whisper falls back to fp32 anyway; setting it explicitly
-  avoids a warning on every call.
-- **Upstream failures are `502`**, not `500`: the request was valid, a dependency failed.
-- **Bad config fails at startup** (unknown engine, missing API key), not on a user request.
-
-### 3. Return the transcription with timestamps per segment
+### Example response (`format=json`)
 
 ```json
 {
-  "filename": "speech.wav",
-  "engine": "local",
+  "filename": "hello.m4a",
   "language": "en",
-  "duration": 4.942,
-  "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny.",
+  "duration": 6.138,
+  "text": "Hello, this is a test of the transcription pipeline, the quick brown fox jumps over the lazy dog.",
   "segments": [
-    {"start": 0.0, "end": 4.76, "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny."}
+    {
+      "id": 1,
+      "start": 0.0,
+      "end": 6.0,
+      "text": "Hello, this is a test of the transcription pipeline, the quick brown fox jumps over the lazy dog.",
+      "confidence": 0.7903
+    }
   ],
-  "source": {"container": "wav", "codec": "pcm_s16le", "sample_rate": 16000, "channels": 1, "duration": 4.942}
+  "metadata": {
+    "engine": "faster-whisper",
+    "model": "tiny",
+    "chunks": 1,
+    "chunks_cut_in_silence": 0,
+    "processing_seconds": 1.442,
+    "source_format": {
+      "codec": "aac",
+      "container": "mov,mp4,m4a,3gp,3g2,mj2",
+      "sample_rate": 22050,
+      "channels": 1
+    }
+  }
 }
 ```
 
-**Decisions**
+This is real output from the `tiny` model on a macOS `say` recording. `processing_seconds` includes loading the model, which happens once per process. `start` and `end` are seconds from the start of the original file, including for long files split into chunks.
 
-- **Segments are Whisper's own phrase-level segments** (`start`/`end` in seconds). They map
-  directly to subtitles (SRT/VTT), search-and-seek in a player, or chunking for an LLM.
-  Word-level timestamps are possible but cost extra compute and bloat the payload; not
-  needed by anything here.
-- **One schema regardless of engine.** Both engines map into the same `Segment` /
-  `Transcription` dataclasses; the hosted API needs `response_format="verbose_json"` to
-  return segments at all. Language is normalised to ISO 639-1 (`en`), because the hosted API
-  returns `english` while local Whisper returns `en`. Downstream code should not care which
-  engine ran.
-- **Millisecond rounding.** Floats like `4.7600000000000001` are noise; subtitle formats
-  use milliseconds.
-- **`duration` is returned** so a consumer can check coverage (last segment end vs. audio
-  length) and compute real-time factor without decoding the file again.
-- **Typed response model** (`TranscriptionResponse`), so the contract is enforced and shows
-  up in the OpenAPI docs at `/docs`.
+---
 
-### 4. How do you handle different audio formats?
+## Pipeline
 
-**Decode everything once, at one place, into one canonical form: 16 kHz mono float32 PCM.**
-That is what Whisper consumes internally, so converting to it loses nothing, and after that
-point no code in the pipeline knows or cares what the input was.
+```
+ upload / CLI path
+        │
+        ▼
+ ┌──────────────┐  stream to disk in 1 MB pieces, size limit (413), empty check (400)
+ │ save upload  │
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐  ffprobe: real audio stream? valid duration? (415)
+ │    probe     │  duration ≤ TP_MAX_DURATION_S (413)
+ └──────┬───────┘  record codec / container / rate / channels
+        │
+        ├── duration > TP_SYNC_MAX_DURATION_S ──► 202 + job_id ──► ThreadPoolExecutor
+        ▼                                                                 │
+ ┌──────────────┐  ffmpeg -vn -ac 1 -ar 16000 -c:a pcm_s16le              │
+ │  normalise   │  ── every later stage sees ONLY this format ──          │
+ └──────┬───────┘                                                         │
+        ▼                                                                 │
+ ┌──────────────┐  ffmpeg silencedetect (long files only)                 │
+ │ plan chunks  │  ~10 min chunks; boundary → nearest silence ±30 s       │
+ └──────┬───────┘  else hard cut + 2 s overlap each side                  │
+        ▼                                                                 │
+ ┌──────────────┐  extract chunk ─► engine.transcribe ─► delete chunk     │
+ │  transcribe  │  TP_CHUNK_WORKERS in parallel, progress after each ─────┘ (job.progress)
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐  shift to absolute time; keep segment only in the chunk
+ │    merge     │  whose OWNED range holds its midpoint; sort by start
+ └──────┬───────┘
+        ▼
+ ┌──────────────┐  whitespace, drop empty, drop hallucinations,
+ │ post-process │  confidence = clamp(exp(avg_logprob)), render json/srt/vtt/txt
+ └──────────────┘
+```
 
-Accepted: WAV, MP3, M4A/AAC, FLAC, OGG/Opus, WebM, MP4 (audio track), AIFF, WMA, AMR.
-Verified by tests that encode real files in each format and check the decoded output.
+## Modules
 
-**Decisions**
-
-- **PyAV (FFmpeg libraries) as the single decoder.** FFmpeg reads practically every
-  container and codec. PyAV links it in-process, so there is no `ffmpeg` binary to install,
-  version-match or shell out to (no subprocess, no command-injection surface), and the
-  service ships as a plain `pip`/`uv` install. Open-source Whisper normally *requires* a
-  system `ffmpeg`; decoding ourselves removes that.
-- **Identify by content, not extension.** The extension is a cheap first gate (checked before
-  the body hits disk), but `probe_audio` opens the file with FFmpeg's demuxer probing. An MP3
-  renamed to `.wav` is still detected and transcribed. A text file renamed `.mp3`, or a
-  truncated file, gets `422` *before* any model time is spent. A video with no audio track gets
-  `415`.
-- **Resample and downmix in the decoder** (`AudioResampler`): 44.1/48 kHz → 16 kHz, stereo or
-  5.1 → mono, any bit depth → float32. Sample-rate mismatches are a classic silent accuracy
-  bug (audio fed at the wrong rate sounds sped-up to the model); this rules it out.
-- **The hosted engine gets normalised audio too.** Instead of forwarding the original upload,
-  it sends 16 kHz mono **FLAC**: lossless, about half the size of WAV and much smaller than a
-  48 kHz stereo original. That means (a) every input format works, though the API itself
-  accepts only ~10, (b) uploads are faster, (c) more audio fits under the 25 MB API limit.
-  Whisper downsamples to 16 kHz mono server-side anyway, so quality is identical.
-- **`source` metadata in the response** (detected container, codec, original rate/channels,
-  duration) for debugging and downstream auditing. It reflects the bytes, not the
-  client's claim.
-
-Trade-off: decoding the whole file into memory costs 64 KB per second of audio, which is fine
-for minutes and wasteful for hours. Q5 fixes that.
-
-### 5. How do you deal with long audio files?
-
-Three separate problems show up as audio gets long. Each one gets its own fix:
-
-| Problem | Fix |
+| File | Responsibility |
 |---|---|
-| **Memory.** A fully decoded hour is ~230 MB of float32, plus model buffers. | Streaming decode into ~10 min chunks (`CHUNK_SECONDS`). Peak memory is one chunk (~40 MB), whatever the file length. |
-| **Hosted API limit.** It rejects files over 25 MB per request. | Each chunk is sent separately as 16 kHz mono FLAC (~1 MB/min), so a 10 min chunk is ~10 MB. |
-| **Latency and timeouts.** An hour on CPU can take longer than a proxy's request timeout, and the client sees nothing until the end. | `?stream=true` returns NDJSON: a `start` event, then `segment` events as each chunk finishes, then `done`. |
+| [`app/config.py`](app/config.py) | `Settings` dataclass read from `TP_*` environment variables |
+| [`app/schemas.py`](app/schemas.py) | Pydantic models: `Segment`, `Metadata`, `TranscriptionResult`, `Job`, `JobStatus`, `OutputFormat` |
+| [`app/audio.py`](app/audio.py) | `probe`, `normalise`, `detect_silences`, `plan_chunks`, `extract`, and the input error types |
+| [`app/engines.py`](app/engines.py) | The `TranscriptionEngine` protocol, `FasterWhisperEngine` (model loaded through `lru_cache`), and `MockEngine` |
+| [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
+| [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
+| [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, upload streaming, in-memory `JobStore`, HTTP error mapping |
+| [`cli.py`](cli.py) | Command-line wrapper around `transcribe_file` |
+| [`tests/`](tests/) | 40 tests covering audio, chunking, post-processing, the pipeline and the API |
 
-```
-{"type": "start", "filename": "long.aiff", "engine": "local", "source": {...}}
-{"type": "segment", "start": 16.24, "end": 19.24, "text": "During the summer, children swim near the old stone bridge."}
-{"type": "segment", "start": 19.35, "end": 25.99, "text": "While merchants carried grain and timber downstream, ..."}
-{"type": "done", "language": "en", "duration": 34.82}
-```
+---
 
-(Real output with `CHUNK_SECONDS=20`: the chunk boundary landed at 19.3 s, in the pause
-between the two sentences, and timestamps continue across it.)
+## Design decisions
 
-**Decisions**
+### Different audio formats
 
-- **Cut in silence, not at a fixed time.** A blind cut every N seconds splits words, and both
-  halves get mis-transcribed. Each cut goes at the quietest 100 ms window within the last 5 s
-  before the target length (RMS energy, a few lines of numpy, no extra VAD model). Ties go to
-  the latest window, so chunks stay close to the target length.
-- **Carry context across the cut.** The tail of the previous chunk's text is passed as
-  Whisper's prompt (`initial_prompt` locally, `prompt` on the API). Names, spelling and
-  punctuation stay consistent across chunks.
-- **Detect language once.** The language of the first chunk that contains speech is pinned
-  for the rest. Otherwise a chunk of music or silence can be "detected" as another language
-  and come back garbled. Chunks with no text never set the language, so a long music intro
-  cannot lock in a wrong guess.
-- **Absolute timestamps.** Segments are shifted by the chunk offset and clamped to the chunk
-  end (Whisper sometimes predicts an end past the audio), so segments never overlap the next
-  chunk.
-- **Chunks cover the audio exactly once.** No overlap, so there is no de-duplication step to
-  get wrong. Tested by checking that the chunk sample counts sum to the input length.
-- **Validation still happens up front in streaming mode.** Bad input returns a real `4xx`
-  before the stream starts. A failure *mid-stream* (e.g. the upstream API goes down on chunk
-  7) arrives as an in-band `{"type": "error"}` event, because the `200` is already sent.
-  Segments already delivered are kept. Temp files are cleaned up even if the client
-  disconnects.
-- **Duration cap** (`MAX_AUDIO_MINUTES`, default 3 h). The file size limit alone is not a
-  cost guard: 500 MB of low-bitrate Opus is ~180 hours, about $65 on the hosted API or days
-  of local GPU time. The duration comes from the probe, so the check costs nothing and
-  rejects the file before any transcription.
-- **Why 10 min chunks.** Whisper itself works in 30 s windows, so chunk size does not affect
-  accuracy, apart from the cut points, which are chosen in silence. Larger chunks mean fewer
-  boundaries and fewer API calls. Smaller chunks mean less memory and more frequent
-  progress. 10 min balances these and stays well under 25 MB.
+- **The file extension is never trusted.** Uploads are saved as `upload` with no extension, and `ffprobe` decides what the content is. A file is accepted only if it has a real audio stream and a positive duration. A text file renamed `.mp3`, a corrupt file, or a video without an audio track gets a **415** with a clear message.
+- **One canonical format.** Every input is converted once to **16 kHz, mono, 16-bit PCM WAV** (`-vn -ac 1 -ar 16000 -c:a pcm_s16le`). 16 kHz mono is what Whisper consumes internally. Nothing after this step handles codecs. That includes chunk extraction, which slices the WAV by frame index using the stdlib `wave` module: it is sample-exact and needs no extra ffmpeg process per chunk. It also covers handing audio to Whisper, which receives a float32 array directly instead of decoding the file a second time.
+- **The source format is recorded.** `metadata.source_format` keeps the original codec, container, sample rate and channel count, which helps debug quality problems ("why is this transcript bad?" → "8 kHz phone audio").
+- **Tested formats:** WAV, MP3, M4A/AAC, OGG (Opus), FLAC, and an AAC track inside MP4 video. Anything ffmpeg can decode works.
 
-**What I would add for production** (deliberately not built here):
+### Long audio
 
-- **Async jobs for very long or bulk audio.** `POST` returns a job id, workers pull from a
-  queue (SQS/Celery), audio and results live in object storage, and clients poll or get a
-  webhook. This survives restarts and retries a failed chunk instead of the whole file. A
-  streaming HTTP request does neither.
-- **Parallel chunks on the hosted engine.** Chunks are independent apart from the prompt, so
-  they could be fanned out with a concurrency limit for a large speed-up. That trades away
-  cross-chunk prompting; a good default for batch work.
+- **Limits.** The upload size (`TP_MAX_UPLOAD_MB`) is enforced on the bytes actually received, not on a client-supplied `Content-Length`. The duration limit (`TP_MAX_DURATION_S`, default 4 h) is checked with ffprobe before any decoding work starts.
+- **Synchronous vs background.** Audio up to `TP_SYNC_MAX_DURATION_S` (120 s) is answered in the request. Anything longer returns **202** with a job ID and is processed on a `ThreadPoolExecutor`. `GET /transcriptions/{id}` reports `progress` after each chunk. Jobs are kept in an in-memory `JobStore`. **In production this would be TaskIQ or Celery on Redis for the queue, object storage (S3/GCS) for uploaded audio, and Postgres for job state and results**, so jobs survive restarts and workers can scale separately from the API.
+- **Why chunk when Whisper already uses 30 s windows internally?**
+  - *Bounded memory.* A 4-hour file is about 460 MB of PCM. Each chunk holds roughly 19 MB.
+  - *Progress.* faster-whisper yields segments lazily but cannot report a reliable fraction done. Counting chunks gives a real `progress` value.
+  - *Parallelism.* `TP_CHUNK_WORKERS` runs chunks concurrently: on several CPU cores today, and the same code path would spread chunks across GPU workers.
+  - *Per-chunk retry.* A failure costs one 10-minute chunk, not the whole file. The chunk is also the natural unit of work for a distributed queue.
+- **Cut in silence, not mid-word.** Boundaries target `TP_CHUNK_SECONDS` (600 s) and move to the midpoint of the nearest silence found by `ffmpeg silencedetect` within ±`TP_SILENCE_SEARCH_S` (30 s). A boundary never moves back far enough to shrink a chunk below half its target size. If no silence is near, the chunk is hard-cut and **both** neighbouring chunks get `TP_CHUNK_OVERLAP_S` (2 s) of extra audio.
+- **Owned range vs cut range.** Each chunk has an *owned* range (its share of the timeline; together the owned ranges cover the file with no gaps or overlaps) and a *cut* range (owned plus overlap, which is the audio actually transcribed).
+- **Merge by midpoint.** Segment timestamps are shifted by `cut_start` to absolute time. A segment is kept **only** by the chunk whose owned range contains its midpoint, so speech in an overlap region is never duplicated and never dropped. The merged segments are then sorted by start time.
+- **Bounded disk use.** Each chunk file is deleted as soon as it has been transcribed. The normalised WAV and the upload sit in a temporary directory that is removed on success, on failure, and when a job finishes.
+
+### Output quality
+
+- **Decoding settings.** `vad_filter=True` skips non-speech, which is faster and reduces hallucinations on silence. `beam_size=5` follows Whisper's own accuracy setting. `condition_on_previous_text=False` stops one bad window from feeding errors into the following windows (the well-known "repetition loop").
+- **Hallucination filter.** A segment is dropped when `no_speech_prob > 0.6` **and** `avg_logprob < -1.0`, which matches Whisper's own thresholds. Both conditions are required: confident speech in a quiet passage is kept.
+- **Cleanup.** Whitespace is collapsed and empty segments are dropped. Segment IDs are renumbered from 1 after filtering, so SRT cue numbers have no gaps.
+- **Confidence.** `clamp(exp(avg_logprob), 0, 1)` is the geometric mean of the token probabilities: easy to read, and good for flagging segments that need human review.
+- **Language.** If none is given, Whisper detects it. For chunked files, the first chunk that contains speech decides, because detection on a silent chunk is unreliable.
+
+### Extensibility
+
+The pipeline only knows the `TranscriptionEngine` protocol (`name`, `model`, `transcribe(wav_path, language)`, `is_loaded()`). Adding OpenAI's API, Deepgram or AssemblyAI takes one new class plus one branch in `build_engine`. Engines always receive a clean 16 kHz mono WAV of at most one chunk, so the 25 MB upload limit on hosted APIs is already respected. `create_app(cfg, engine)` takes both dependencies as arguments, which is how the tests run against `MockEngine` with small chunk settings.
+
+### Configuration
+
+All settings are environment variables prefixed with `TP_`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TP_ENGINE` | `faster-whisper` | `faster-whisper` or `mock` |
+| `TP_MODEL_SIZE` | `base` | `tiny`, `base`, `small`, `medium`, `large-v3` |
+| `TP_DEVICE` | `cpu` | `cpu`, `cuda`, `auto` |
+| `TP_COMPUTE_TYPE` | `int8` | CTranslate2 compute type (`float16` on GPU) |
+| `TP_MAX_UPLOAD_MB` | `500` | Upload size limit (413) |
+| `TP_MAX_DURATION_S` | `14400` | Audio duration limit (413) |
+| `TP_SYNC_MAX_DURATION_S` | `120` | Longer audio becomes a background job (202) |
+| `TP_JOB_WORKERS` | `2` | Concurrent background jobs |
+| `TP_CHUNK_SECONDS` | `600` | Target chunk length |
+| `TP_SILENCE_SEARCH_S` | `30` | Search window around each boundary |
+| `TP_CHUNK_OVERLAP_S` | `2` | Overlap added on both sides of a hard cut |
+| `TP_SILENCE_NOISE_DB` | `-35` | `silencedetect` noise floor |
+| `TP_SILENCE_MIN_S` | `0.5` | Minimum silence length |
+| `TP_CHUNK_WORKERS` | `1` | Chunks transcribed in parallel per file |
+
+### Alternatives considered
+
+| Option | Decision | Why |
+|---|---|---|
+| `openai-whisper` (reference implementation) | **faster-whisper** | Same model weights, up to 4x faster with less memory (the project's published benchmarks), and supports `int8` on CPU. It includes a Silero VAD filter, so a separate VAD step isn't needed. |
+| Hosted API only (OpenAI, Deepgram) | **Local model, API engines pluggable** | No per-minute cost, and audio never leaves the machine, which matters for sensitive recordings. A hosted engine is one class away if latency or GPU cost becomes the constraint. |
+| PyAV / pydub for decoding | **ffmpeg / ffprobe subprocess** | ffmpeg is the most complete decoder available, its CLI interface is stable, and probing, normalising and `silencedetect` all use one tool. Running it as a subprocess also keeps a crash on a malformed file out of the API process. |
+| Trust the extension or MIME type | **Probe the content** | Both are client-controlled. ffprobe reading the actual streams is the only reliable check. |
+| Fixed-size chunks | **Silence-snapped chunks, with overlap as fallback** | Fixed cuts split words, and Whisper then garbles both halves. Snapping costs one fast `silencedetect` pass. The overlap plus midpoint ownership keeps hard cuts correct too. |
+| De-duplicate overlaps by text similarity | **Midpoint ownership** | Deterministic and O(n). Text matching is fuzzy and can drop real repeated speech ("no, no"). |
+| Always asynchronous | **Synchronous up to 120 s, background job beyond** | Most short clips finish in a few seconds, and a single request is simpler for clients. Long files must not hold an HTTP connection open for minutes. |
+| Streaming segments over HTTP (NDJSON or SSE) | **Polling jobs** | Polling survives client disconnects and proxies, and maps directly onto a real queue later. Streaming could be added for live captions. |
+| Processes for chunk parallelism | **Threads** | CTranslate2 releases the GIL during inference and ffmpeg runs in its own process, so threads get real parallelism while sharing one loaded model in memory. |
+
+### What I'd do next for production
+
+1. **Queue and storage.** Replace the in-memory job store with TaskIQ/Celery on Redis, keep uploads and results in object storage (S3/GCS) with presigned upload URLs so large files bypass the API, and store job state in Postgres. Add retries per chunk and idempotency keys.
+2. **GPU workers with `large-v3`** (`float16`, batched inference), autoscaled on queue depth. Keep the CPU `base` model as a cheap tier.
+3. **Speaker diarization** (pyannote) merged onto segments, giving `speaker` labels.
+4. **Word-level timestamps** (`word_timestamps=True`) for subtitle editing and search.
+5. **Quality tracking.** WER on a held-out, domain-specific labelled set in CI, run on every model or setting change, plus confidence distributions in production dashboards.
+6. **Authentication and rate limits.** API keys or OAuth, per-tenant quotas on minutes of audio, request size limits at the gateway.
+7. **Retention policy.** Delete audio after N days, encrypt at rest, offer PII redaction, and log access to transcripts.
+8. **Operations.** Structured logs, Prometheus metrics (real-time factor, queue latency, failure rate), tracing, and graceful shutdown that hands unfinished jobs back to the queue.
