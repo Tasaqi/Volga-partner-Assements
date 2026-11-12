@@ -22,6 +22,14 @@ def test_short_file_single_chunk(make_tone, cfg, engine):
     assert result.text.startswith("mock segment 1")
 
 
+def test_each_file_logs_one_metrics_line(make_tone, cfg, engine, caplog):
+    caplog.set_level("INFO", logger="app.pipeline")
+    transcribe_file(make_tone("a.wav", 5.0), cfg, engine)
+    line = caplog.records[-1].getMessage()
+    assert line.startswith("transcribed file=a.wav duration_s=5.0 chunks=1 fallback_chunks=0")
+    assert "engine=mock" in line and "rtf=" in line
+
+
 def test_progress_callback_reports_each_chunk(make_gapped, cfg, engine):
     wav = make_gapped(seconds=30)
     seen: list[float] = []

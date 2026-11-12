@@ -5,6 +5,7 @@ Run: ``uvicorn app.api:create_app --factory --port 8000``
 
 from __future__ import annotations
 
+import logging
 import secrets
 import shutil
 import tempfile
@@ -29,6 +30,7 @@ from app.schemas import Job, JobStatus, OutputFormat, TranscriptionResult
 
 UPLOAD_PIECE = 1024 * 1024  # copy uploads in 1 MB pieces
 MULTIPART_OVERHEAD = 1024 * 1024  # room for multipart headers around the file itself
+log = logging.getLogger(__name__)
 
 ERROR_STATUS: dict[type[AudioError], int] = {
     UnsupportedAudioError: 415,
@@ -149,6 +151,8 @@ def _respond(result: TranscriptionResult, fmt: OutputFormat) -> Response:
 
 def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None = None) -> FastAPI:
     cfg = cfg or Settings.from_env()
+    # uvicorn configures only its own loggers; this makes app logs visible (no-op if set up).
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     engine = engine or build_engine(cfg)
     jobs = JobStore()
     executor = ThreadPoolExecutor(max_workers=cfg.job_workers, thread_name_prefix="tp-job")
@@ -168,6 +172,7 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
 
     @app.exception_handler(TranscriptionError)
     async def engine_error(_: Request, exc: TranscriptionError) -> JSONResponse:
+        log.error("transcription failed status=%d: %s", exc.status_code, exc)
         return JSONResponse({"detail": str(exc)}, status_code=exc.status_code)
 
     @app.get("/health")
@@ -189,6 +194,7 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
             )
             jobs.complete(job_id, result)
         except Exception as exc:  # noqa: BLE001 - job must record any failure
+            log.error("job failed job_id=%s: %s", job_id, exc)
             jobs.update(job_id, status=JobStatus.failed, error=str(exc) or type(exc).__name__)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

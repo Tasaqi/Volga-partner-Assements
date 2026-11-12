@@ -6,6 +6,7 @@ and it can be reused from a worker or script unchanged.
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from app.postprocess import finalize_segments
 from app.schemas import Metadata, TranscriptionResult
 
 ProgressCallback = Callable[[float], None]
+log = logging.getLogger(__name__)
 
 
 def inspect(path: Path, cfg: Settings) -> AudioInfo:
@@ -140,7 +142,7 @@ def transcribe_file(
 
     raw = merge_chunks([(c, r.segments) for c, r in zip(chunks, engine_results)])
     segments = finalize_segments(raw)
-    return TranscriptionResult(
+    result = TranscriptionResult(
         filename=filename or path.name,
         language=language or _pick_language(engine_results),
         duration=round(duration, 3),
@@ -156,3 +158,11 @@ def transcribe_file(
             source_format=info.as_metadata(),
         ),
     )
+    m = result.metadata
+    # One key=value line per file: enough to alert on fallback rate and real-time factor (rtf).
+    log.info(
+        "transcribed file=%s duration_s=%.1f chunks=%d fallback_chunks=%d engine=%s "
+        "processing_s=%.2f rtf=%.2f", result.filename, result.duration, m.chunks,
+        m.fallback_chunks, m.engine, m.processing_seconds, m.processing_seconds / result.duration,
+    )
+    return result

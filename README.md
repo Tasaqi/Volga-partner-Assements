@@ -175,7 +175,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, `RequestGuard` (auth and size checked before the body is read), upload streaming, in-memory `JobStore`, HTTP error mapping |
-| [`tests/`](tests/) | 86 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
+| [`tests/`](tests/) | 87 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
 
 ---
 
@@ -230,6 +230,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 - **Fail at startup, not mid-outage.** Every local model in the chain is loaded when the service starts, under a lock, so parallel first requests cannot each load their own multi-GB copy. A broken fallback should stop the deploy, not appear for the first time during an OpenAI incident. A missing `OPENAI_API_KEY` logs a warning and the chain runs without OpenAI, whether OpenAI was the primary or the fallback, so the service still works offline and in CI. Invalid settings (for example `TP_CHUNK_SECONDS=0`) also fail at startup with a clear message, and blank values in `.env` mean "use the default".
 - **Errors from both engines look the same.** OpenAI SDK errors and local CTranslate2 `RuntimeError`s (for example, out of memory) both become `TranscriptionError`. That makes the reverse chain work too (`TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=openai`). If both engines fail, the error message names both causes.
 - **Traceable output.** `metadata.engine` shows the chain (`openai+faster-whisper`) and `metadata.fallback_chunks` counts how many chunks the fallback produced. A drop in quality can then be traced to its cause.
+- **One log line per file.** Each transcription logs `transcribed file=... duration_s=... chunks=... fallback_chunks=... engine=... processing_s=... rtf=...`, and every failed request or job logs an error with its cause. That is enough to alert on fallback rate, failures and real-time factor (processing time divided by audio length) before adding a metrics stack.
 - **Same output from both engines.** Each chunk is sent to OpenAI as lossless FLAC. For speech that is about half the size of WAV (measured 0.51x), so a 10-minute chunk is about 10 MB. Noise barely compresses (measured 0.93x), so the bound that matters is the worst case: with the defaults, the longest chunk is 634 s, about 20 MB even uncompressed. At startup the service refuses chunk settings that could pass OpenAI's 25 MB upload limit (`TP_CHUNK_SECONDS + TP_SILENCE_SEARCH_S + 2 x TP_CHUNK_OVERLAP_S` must be at most 781 s). The request uses `verbose_json`, so the response includes `avg_logprob` and `no_speech_prob`, and the confidence score and hallucination filter work exactly as they do for local output. Language names are mapped to ISO codes.
 - **Privacy trade-off.** The default sends audio to OpenAI. For sensitive recordings, set `TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=none` and audio never leaves the machine.
 
@@ -286,4 +287,4 @@ All settings are environment variables prefixed with `TP_`. [`.env.example`](.en
 5. **Quality tracking.** WER on a held-out, domain-specific labelled set in CI, run on every model or setting change, plus confidence distributions in production dashboards.
 6. **Authentication and rate limits.** Per-tenant API keys or OAuth (today: one shared `TP_API_KEY`), per-tenant quotas on minutes of audio, request size limits at the gateway.
 7. **Retention policy.** Delete audio after N days, encrypt at rest, offer PII redaction, and log access to transcripts.
-8. **Operations.** Structured logs, Prometheus metrics (real-time factor, queue latency, failure rate), tracing, and graceful shutdown that hands unfinished jobs back to the queue.
+8. **Operations.** JSON logs shipped to a log store (today: one key=value line per file), Prometheus metrics (real-time factor, queue latency, failure rate), tracing, and graceful shutdown that hands unfinished jobs back to the queue.

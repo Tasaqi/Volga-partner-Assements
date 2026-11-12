@@ -225,7 +225,7 @@ def test_corrupt_file_returns_415(client, tmp_path):
     assert r.status_code == 415 and "audio" in r.json()["detail"]
 
 
-def test_failed_job_reports_status_and_error(cfg, make_gapped):
+def test_failed_job_reports_status_and_error(cfg, make_gapped, caplog):
     from app.engines import TranscriptionError
 
     class Down(MockEngine):
@@ -238,3 +238,4 @@ def test_failed_job_reports_status_and_error(cfg, make_gapped):
         job = _wait_for_job(c, r.json()["job_id"]).json()
     assert job["status"] == "failed"
     assert "out of memory" in job["error"]
+    assert any("job failed" in r.getMessage() for r in caplog.records)  # visible to alerting
