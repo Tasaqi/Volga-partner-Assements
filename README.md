@@ -186,8 +186,10 @@ between the two sentences, and timestamps continue across it.)
 - **Carry context across the cut.** The tail of the previous chunk's text is passed as
   Whisper's prompt (`initial_prompt` locally, `prompt` on the API). Names, spelling and
   punctuation stay consistent across chunks.
-- **Detect language once.** The first chunk's language is pinned for the rest. Otherwise a
-  chunk of music or silence can be "detected" as another language and come back garbled.
+- **Detect language once.** The language of the first chunk that contains speech is pinned
+  for the rest. Otherwise a chunk of music or silence can be "detected" as another language
+  and come back garbled. Chunks with no text never set the language, so a long music intro
+  cannot lock in a wrong guess.
 - **Absolute timestamps.** Segments are shifted by the chunk offset and clamped to the chunk
   end (Whisper sometimes predicts an end past the audio), so segments never overlap the next
   chunk.

@@ -21,11 +21,12 @@ def transcribe_chunks(
             samples,
             # Continuity across the cut: names, spelling and punctuation style carry over.
             prompt=previous_text[-PROMPT_CHARS:] or None,
-            # Detect language once. A chunk of music or silence can otherwise be "detected"
-            # as a different language and come back garbled.
+            # Detect language once, then pin it. A chunk of music or silence can otherwise be
+            # "detected" as a different language and come back garbled.
             language=language,
         )
-        language = language or result.language
+        if result.text:  # a guess from a chunk with no speech (e.g. a music intro) is noise
+            language = language or result.language
         previous_text = result.text or previous_text
         chunk_end = offset + result.duration
         yield Transcription(

@@ -127,3 +127,25 @@ def test_decoding_is_streamed_not_buffered(tmp_path, monkeypatch):
     monkeypatch.setattr(av.container.InputContainer, "decode", counting_decode)
     next(iter_chunks(path, chunk_seconds=10))
     assert decoded["seconds"] < 12  # ~one chunk plus a frame, not all 60 s
+
+
+def test_language_is_not_pinned_from_a_chunk_without_speech(long_file):
+    class IntroThenSpeech:
+        """Chunk 1 is a music intro: no text and a bogus language guess."""
+
+        name = "x"
+
+        def __init__(self):
+            self.languages_passed = []
+
+        def transcribe(self, samples, *, prompt=None, language=None):
+            self.languages_passed.append(language)
+            d = len(samples) / SR
+            if len(self.languages_passed) == 1:
+                return Transcription("", "cy", d, [])
+            return Transcription("speech", language or "en", d, [Segment(0.0, d, "speech")])
+
+    engine = IntroThenSpeech()
+    result = merge(transcribe_chunks(long_file, engine, chunk_seconds=10))
+    assert engine.languages_passed == [None, None, "en"]  # detected again on chunk 2, then pinned
+    assert result.language == "en"
