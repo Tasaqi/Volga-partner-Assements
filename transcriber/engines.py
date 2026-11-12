@@ -4,7 +4,9 @@ The API layer depends only on the `Transcriber` protocol, so engines are swappab
 configuration and tests can inject a fake without touching a real model or network.
 """
 
+import logging
 import threading
+import time
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Protocol
@@ -15,10 +17,15 @@ from transcriber.audio import WHISPER_SAMPLE_RATE, encode_audio
 from transcriber.config import Settings, settings
 
 
+log = logging.getLogger(__name__)
+
+
 class TranscriptionError(Exception):
     """The engine failed on input that passed validation."""
 
-    status_code = 502
+    def __init__(self, message: str, status_code: int = 502):
+        super().__init__(message)
+        self.status_code = status_code  # 502: upstream API failed; 500: local engine failed
 
 
 @dataclass
@@ -77,10 +84,13 @@ class LocalWhisperTranscriber:
         self._lock = threading.Lock()
 
     def transcribe(self, samples, *, prompt=None, language=None) -> Transcription:
-        with self._lock:
-            result = self._model.transcribe(
-                samples, fp16=self._fp16, initial_prompt=prompt, language=language
-            )
+        try:
+            with self._lock:
+                result = self._model.transcribe(
+                    samples, fp16=self._fp16, initial_prompt=prompt, language=language
+                )
+        except RuntimeError as e:  # PyTorch failures, e.g. CUDA out of memory
+            raise TranscriptionError(f"Local transcription failed: {e}", status_code=500) from e
         return Transcription(
             text=result["text"].strip(),
             language=result.get("language"),
@@ -98,7 +108,9 @@ class OpenAIWhisperTranscriber:
         if client is None:
             from openai import OpenAI
 
-            client = OpenAI()  # reads OPENAI_API_KEY; raises at startup if missing
+            # Reads OPENAI_API_KEY (raises at startup if missing). The SDK retries 429/5xx and
+            # connection errors with exponential backoff; only after that do we fall back.
+            client = OpenAI(timeout=120, max_retries=2)
         self._client = client
         self._model = model_name
 
@@ -128,12 +140,50 @@ class OpenAIWhisperTranscriber:
         )
 
 
-def build_transcriber(cfg: Settings) -> Transcriber:
-    if cfg.engine == "local":
+class FallbackTranscriber:
+    """Try ``primary``; if it fails, transcribe the same chunk with ``fallback``.
+
+    A failure opens a simple circuit breaker: for ``cooldown`` seconds the primary is skipped,
+    so during an outage each chunk does not first wait out the primary's retries and timeout.
+    """
+
+    def __init__(self, primary: Transcriber, fallback: Transcriber, cooldown: float = 60.0):
+        self.name = f"{primary.name}+{fallback.name}"
+        self._primary, self._fallback, self._cooldown = primary, fallback, cooldown
+        self._skip_primary_until = 0.0  # shared across requests; a racy read only costs one call
+
+    def transcribe(self, samples, *, prompt=None, language=None) -> Transcription:
+        kwargs = {"prompt": prompt, "language": language}
+        primary_error = "skipped: primary recently failed"
+        if time.monotonic() >= self._skip_primary_until:
+            try:
+                return self._primary.transcribe(samples, **kwargs)
+            except TranscriptionError as e:
+                self._skip_primary_until = time.monotonic() + self._cooldown
+                primary_error = str(e)
+                log.warning("%s failed, using %s: %s", self._primary.name, self._fallback.name, e)
+        try:
+            return self._fallback.transcribe(samples, **kwargs)
+        except TranscriptionError as e:
+            raise TranscriptionError(
+                f"{self._primary.name}: {primary_error}; {self._fallback.name}: {e}", e.status_code
+            ) from e
+
+
+def _engine(name: str, cfg: Settings) -> Transcriber:
+    if name == "local":
         return LocalWhisperTranscriber(cfg.whisper_model)
-    if cfg.engine == "openai":
+    if name == "openai":
         return OpenAIWhisperTranscriber(cfg.openai_model)
-    raise ValueError(f"Unknown TRANSCRIBER_ENGINE '{cfg.engine}' (expected 'local' or 'openai')")
+    raise ValueError(f"Unknown transcription engine '{name}' (expected 'local' or 'openai')")
+
+
+def build_transcriber(cfg: Settings) -> Transcriber:
+    primary = _engine(cfg.engine, cfg)
+    if cfg.fallback_engine in ("", "none", cfg.engine):
+        return primary
+    # Built eagerly: a broken fallback should fail the deploy, not surface mid-outage.
+    return FallbackTranscriber(primary, _engine(cfg.fallback_engine, cfg))
 
 
 @lru_cache(maxsize=1)

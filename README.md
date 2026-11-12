@@ -31,6 +31,7 @@ Interactive API docs: <http://localhost:8000/docs>
 |---|---|---|
 | `MAX_UPLOAD_MB` | `500` | Reject uploads larger than this (HTTP 413) |
 | `TRANSCRIBER_ENGINE` | `local` | `local` (open-source Whisper in-process) or `openai` (hosted API) |
+| `TRANSCRIBER_FALLBACK` | `local` | Engine used when the primary fails; `none` disables |
 | `WHISPER_MODEL` | `base` | Local model size: `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
 | `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Hosted model when `TRANSCRIBER_ENGINE=openai` |
 | `OPENAI_API_KEY` | – | Required for the `openai` engine |
@@ -77,6 +78,22 @@ Response shape is shown in Q3.
     minute, sends audio to a third party, and caps uploads at 25 MB (handled in Q5).
   - The API layer only knows the protocol, so switching is one env var. Tests inject a fake
     engine through FastAPI's dependency overrides.
+- **Automatic fallback between engines.** With `TRANSCRIBER_ENGINE=openai` the service
+  falls back to open-source Whisper by default (`TRANSCRIBER_FALLBACK=local`), so an OpenAI
+  outage, rate limit or revoked key degrades the service instead of failing it. It works in
+  both directions (`local` primary with `openai` fallback covers e.g. GPU out-of-memory).
+  - **Retry first, then fall back.** The OpenAI SDK already retries 429/5xx/connection errors
+    with exponential backoff (`max_retries=2`, `timeout=120s`). The fallback runs only once
+    those are exhausted.
+  - **Per chunk, not per file.** On long audio only the chunks that failed are re-done on
+    the fallback, with the same prompt and language context.
+  - **Circuit breaker.** After a failure the primary is skipped for 60 s, so during an outage
+    each chunk does not first wait out retries and timeouts. Verified by simulating an outage:
+    a 35 s file in two chunks logged one failure and returned `200` from local Whisper in 3 s.
+  - **Visible, not silent.** The response's `engine` is `openai+local` and every fallback logs
+    a warning with the cause. If both engines fail, the error contains both reasons.
+  - **The fallback is loaded at startup.** That costs memory even when it is never used, but a
+    broken fallback fails the deploy instead of being discovered in the middle of an outage.
 - **Load the model once per process, at startup** (FastAPI lifespan + `lru_cache`). Loading
   takes seconds; per request it would dominate latency, and lazily the first user pays it.
 - **Serialise local inference with a lock.** One model is shared by every request thread.

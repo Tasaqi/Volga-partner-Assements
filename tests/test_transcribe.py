@@ -73,5 +73,5 @@ def test_openai_engine_maps_upstream_errors():
 
 
 def test_unknown_engine_fails_fast():
-    with pytest.raises(ValueError, match="Unknown TRANSCRIBER_ENGINE"):
+    with pytest.raises(ValueError, match="Unknown transcription engine"):
         build_transcriber(Settings(engine="nope"))

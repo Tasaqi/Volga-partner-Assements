@@ -9,6 +9,9 @@ class Settings:
     max_upload_mb: int = field(default_factory=lambda: int(os.getenv("MAX_UPLOAD_MB", "500")))
     # "local" runs open-source Whisper in-process; "openai" calls the hosted Whisper API.
     engine: str = field(default_factory=lambda: os.getenv("TRANSCRIBER_ENGINE", "local"))
+    # Used when the primary engine fails. Defaults to local Whisper, so the hosted engine
+    # degrades to open source instead of erroring. "none" disables; same as engine = no-op.
+    fallback_engine: str = field(default_factory=lambda: os.getenv("TRANSCRIBER_FALLBACK", "local"))
     whisper_model: str = field(default_factory=lambda: os.getenv("WHISPER_MODEL", "base"))
     openai_model: str = field(default_factory=lambda: os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1"))
     # Long audio is processed in chunks of about this length. 10 min keeps memory at ~40 MB
