@@ -18,6 +18,8 @@ class Settings:
     # Long audio is processed in chunks of about this length. 10 min keeps memory at ~40 MB
     # per chunk and the FLAC upload (~1 MB/min) well under the hosted API's 25 MB cap.
     chunk_seconds: float = field(default_factory=lambda: float(_env("CHUNK_SECONDS", "600")))
+    # Cost/capacity guard: 500 MB of low-bitrate Opus is ~180 hours of audio.
+    max_audio_minutes: float = field(default_factory=lambda: float(_env("MAX_AUDIO_MINUTES", "180")))
 
     @property
     def max_upload_bytes(self) -> int:

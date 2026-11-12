@@ -35,6 +35,7 @@ Interactive API docs: <http://localhost:8000/docs>
 | `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Hosted model when `TRANSCRIBER_ENGINE=openai` |
 | `OPENAI_API_KEY` | – | Required for the `openai` engine |
 | `CHUNK_SECONDS` | `600` | Target chunk length for long audio |
+| `MAX_AUDIO_MINUTES` | `180` | Reject longer audio (HTTP 413), checked before transcription |
 
 ## Part 1: Transcription Pipeline
 
@@ -197,6 +198,10 @@ between the two sentences, and timestamps continue across it.)
   7) arrives as an in-band `{"type": "error"}` event, because the `200` is already sent.
   Segments already delivered are kept. Temp files are cleaned up even if the client
   disconnects.
+- **Duration cap** (`MAX_AUDIO_MINUTES`, default 3 h). The file size limit alone is not a
+  cost guard: 500 MB of low-bitrate Opus is ~180 hours, about $65 on the hosted API or days
+  of local GPU time. The duration comes from the probe, so the check costs nothing and
+  rejects the file before any transcription.
 - **Why 10 min chunks.** Whisper itself works in 30 s windows, so chunk size does not affect
   accuracy, apart from the cut points, which are chosen in silence. Larger chunks mean fewer
   boundaries and fewer API calls. Smaller chunks mean less memory and more frequent
@@ -211,5 +216,3 @@ between the two sentences, and timestamps continue across it.)
 - **Parallel chunks on the hosted engine.** Chunks are independent apart from the prompt, so
   they could be fanned out with a concurrency limit for a large speed-up. That trades away
   cross-chunk prompting; a good default for batch work.
-- **A duration cap per request** (e.g. `MAX_AUDIO_MINUTES`) as a cost guard, especially for
-  the hosted engine.

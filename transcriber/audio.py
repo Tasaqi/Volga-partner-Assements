@@ -34,6 +34,10 @@ class FileTooLargeError(AudioError):
     status_code = 413
 
 
+class AudioTooLongError(AudioError):
+    status_code = 413
+
+
 class EmptyFileError(AudioError):
     status_code = 400
 

@@ -42,3 +42,10 @@ def test_rejects_oversized_upload(client, monkeypatch):
 def test_client_filename_cannot_escape_dest_dir(tmp_path):
     path = save_upload(io.BytesIO(b"data"), "../../evil.wav", tmp_path, max_bytes=100)
     assert path.parent == tmp_path
+
+
+def test_rejects_audio_longer_than_limit(client, fake, monkeypatch):
+    monkeypatch.setattr(api, "settings", Settings(max_audio_minutes=0.01))  # 0.6 s
+    r = client.post("/transcribe", files={"file": ("clip.wav", make_wav(seconds=2))})
+    assert r.status_code == 413 and "minute limit" in r.json()["detail"]
+    assert fake.calls == []

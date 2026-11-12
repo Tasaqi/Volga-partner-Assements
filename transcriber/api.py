@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from transcriber.audio import AudioError, AudioInfo, probe_audio, save_upload
+from transcriber.audio import AudioError, AudioInfo, AudioTooLongError, probe_audio, save_upload
 from transcriber.config import settings
 from transcriber.engines import Segment, Transcriber, Transcription, TranscriptionError, get_transcriber
 from transcriber.pipeline import merge, transcribe_chunks
@@ -88,6 +88,10 @@ def transcribe(
         # in streaming mode.
         path = save_upload(file.file, file.filename, tmp.name, settings.max_upload_bytes)
         source = probe_audio(path)  # reject non-audio before spending model time on it
+        # shortcut: files whose container records no duration skip this check; enforce it
+        # while decoding if such inputs become common.
+        if source.duration and source.duration > settings.max_audio_minutes * 60:
+            raise AudioTooLongError(f"Audio exceeds the {settings.max_audio_minutes:g} minute limit")
     except BaseException:
         tmp.cleanup()
         raise
