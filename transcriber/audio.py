@@ -4,7 +4,7 @@ import io
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Iterator
 
 import av
 import numpy as np
@@ -101,25 +101,73 @@ def probe_audio(path: str | Path) -> AudioInfo:
         raise UndecodableAudioError(f"Could not read audio: {e}") from e
 
 
-def load_audio(path: str | Path) -> np.ndarray:
-    """Decode any container/codec to the 16 kHz mono float32 PCM that Whisper expects.
+def _decode_blocks(path: str | Path) -> Iterator[np.ndarray]:
+    """Stream-decode any container/codec as 16 kHz mono float32 PCM, one small block at a time.
 
     This is the single normalisation point: sample rate, channel count, bit depth and codec
     differences all disappear here, so nothing downstream handles formats. PyAV bundles the
     FFmpeg libraries, so there is no dependency on a system `ffmpeg` binary.
     """
+    produced = False
     try:
         with av.open(str(path)) as container:
             resampler = av.AudioResampler(format="s16", layout="mono", rate=WHISPER_SAMPLE_RATE)
-            frames = []
-            for frame in container.decode(audio=0):
-                frames.extend(f.to_ndarray() for f in resampler.resample(frame))
-            frames.extend(f.to_ndarray() for f in resampler.resample(None))  # flush
+            for frame in [*container.decode(audio=0), None]:  # None flushes the resampler
+                for out in resampler.resample(frame):
+                    produced = True
+                    yield out.to_ndarray().ravel().astype(np.float32) / 32768.0
     except av.error.FFmpegError as e:
         raise UndecodableAudioError(f"Could not decode audio: {e}") from e
-    if not frames:
+    if not produced:
         raise UndecodableAudioError("Audio stream contains no samples")
-    return np.concatenate(frames, axis=1).ravel().astype(np.float32) / 32768.0
+
+
+def load_audio(path: str | Path) -> np.ndarray:
+    """Decode the whole file into memory. Fine for short clips; use `iter_chunks` for long ones."""
+    return np.concatenate(list(_decode_blocks(path)))
+
+
+def _quietest_point(audio: np.ndarray, lo: int, hi: int, window: int) -> int:
+    """Index of the centre of the lowest-energy window in audio[lo:hi]."""
+    region = audio[lo:hi]
+    n = len(region) // window
+    if n == 0:
+        return hi
+    energy = np.square(region[: n * window].reshape(n, window)).mean(axis=1)
+    quietest = n - 1 - int(energy[::-1].argmin())  # ties go to the latest window: longer chunks
+    return lo + quietest * window + window // 2
+
+
+def iter_chunks(
+    path: str | Path, chunk_seconds: float, search_seconds: float = 5.0
+) -> Iterator[tuple[float, np.ndarray]]:
+    """Yield ``(offset_seconds, samples)`` chunks of about ``chunk_seconds`` each.
+
+    Memory is bounded by one chunk, whatever the file length. Each cut is placed at the
+    quietest 100 ms within the last ``search_seconds`` before the target length, so chunk
+    boundaries land in pauses between words instead of splitting one.
+    """
+    chunk_len = int(chunk_seconds * WHISPER_SAMPLE_RATE)
+    search_len = min(int(search_seconds * WHISPER_SAMPLE_RATE), chunk_len // 2)
+    window = WHISPER_SAMPLE_RATE // 10
+    offset = 0
+    pending: list[np.ndarray] = []
+    pending_len = 0
+    for block in _decode_blocks(path):
+        pending.append(block)
+        pending_len += len(block)
+        if pending_len < chunk_len:
+            continue
+        # Concatenate once per chunk, not once per block (which would be quadratic).
+        buf = np.concatenate(pending)
+        while len(buf) >= chunk_len:
+            cut = _quietest_point(buf, chunk_len - search_len, chunk_len, window)
+            yield offset / WHISPER_SAMPLE_RATE, buf[:cut]
+            offset += cut
+            buf = buf[cut:]
+        pending, pending_len = [buf], len(buf)
+    if pending_len:
+        yield offset / WHISPER_SAMPLE_RATE, np.concatenate(pending)
 
 
 def encode_audio(

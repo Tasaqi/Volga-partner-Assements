@@ -7,6 +7,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from transcriber.api import app
+from transcriber.audio import WHISPER_SAMPLE_RATE
 from transcriber.engines import Segment, Transcription, get_transcriber
 
 
@@ -23,20 +24,29 @@ def make_wav(seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> byte
 
 
 class FakeTranscriber:
-    """Mock engine: tests never download a model or call the network."""
+    """Mock engine: tests never download a model or call the network.
+
+    Returns two segments splitting the chunk in half, like a real engine would.
+    """
 
     name = "fake"
 
-    def __init__(self):
+    def __init__(self, language="en"):
         self.calls = []
+        self.language = language
 
-    def transcribe(self, audio_path):
-        self.calls.append(audio_path)
+    def transcribe(self, samples, *, prompt=None, language=None):
+        self.calls.append({"samples": len(samples), "prompt": prompt, "language": language})
+        duration = len(samples) / WHISPER_SAMPLE_RATE
+        n = len(self.calls)
         return Transcription(
-            text="hello world",
-            language="en",
-            duration=2.0,
-            segments=[Segment(0.0, 1.0, "hello"), Segment(1.0, 2.0, "world")],
+            text=f"hello{n} world{n}",
+            language=language or self.language,
+            duration=round(duration, 3),
+            segments=[
+                Segment(0.0, duration / 2, f"hello{n}"),
+                Segment(duration / 2, duration, f"world{n}"),
+            ],
         )
 
 

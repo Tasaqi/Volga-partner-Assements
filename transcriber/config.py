@@ -15,6 +15,9 @@ class Settings:
     engine: str = field(default_factory=lambda: _env("TRANSCRIBER_ENGINE", "local"))
     whisper_model: str = field(default_factory=lambda: _env("WHISPER_MODEL", "base"))
     openai_model: str = field(default_factory=lambda: _env("OPENAI_TRANSCRIBE_MODEL", "whisper-1"))
+    # Long audio is processed in chunks of about this length. 10 min keeps memory at ~40 MB
+    # per chunk and the FLAC upload (~1 MB/min) well under the hosted API's 25 MB cap.
+    chunk_seconds: float = field(default_factory=lambda: float(_env("CHUNK_SECONDS", "600")))
 
     @property
     def max_upload_bytes(self) -> int:

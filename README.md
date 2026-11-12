@@ -18,6 +18,9 @@ uv sync
 uv run pytest
 uv run uvicorn transcriber.api:app --reload
 curl -F "file=@sample.wav" http://localhost:8000/transcribe
+
+# long files: stream segments as they are produced (NDJSON)
+curl -N -F "file=@podcast.mp3" "http://localhost:8000/transcribe?stream=true"
 ```
 
 Interactive API docs: <http://localhost:8000/docs>
@@ -31,6 +34,7 @@ Interactive API docs: <http://localhost:8000/docs>
 | `WHISPER_MODEL` | `base` | Local model size: `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
 | `OPENAI_TRANSCRIBE_MODEL` | `whisper-1` | Hosted model when `TRANSCRIBER_ENGINE=openai` |
 | `OPENAI_API_KEY` | – | Required for the `openai` engine |
+| `CHUNK_SECONDS` | `600` | Target chunk length for long audio |
 
 ## Part 1: Transcription Pipeline
 
@@ -151,3 +155,61 @@ Verified by tests that encode real files in each format and check the decoded ou
 
 Trade-off: decoding the whole file into memory costs 64 KB per second of audio, which is fine
 for minutes and wasteful for hours. Q5 fixes that.
+
+### 5. How do you deal with long audio files?
+
+Three separate problems show up as audio gets long. Each one gets its own fix:
+
+| Problem | Fix |
+|---|---|
+| **Memory.** A fully decoded hour is ~230 MB of float32, plus model buffers. | Streaming decode into ~10 min chunks (`CHUNK_SECONDS`). Peak memory is one chunk (~40 MB), whatever the file length. |
+| **Hosted API limit.** It rejects files over 25 MB per request. | Each chunk is sent separately as 16 kHz mono FLAC (~1 MB/min), so a 10 min chunk is ~10 MB. |
+| **Latency and timeouts.** An hour on CPU can take longer than a proxy's request timeout, and the client sees nothing until the end. | `?stream=true` returns NDJSON: a `start` event, then `segment` events as each chunk finishes, then `done`. |
+
+```
+{"type": "start", "filename": "long.aiff", "engine": "local", "source": {...}}
+{"type": "segment", "start": 16.24, "end": 19.24, "text": "During the summer, children swim near the old stone bridge."}
+{"type": "segment", "start": 19.35, "end": 25.99, "text": "While merchants carried grain and timber downstream, ..."}
+{"type": "done", "language": "en", "duration": 34.82}
+```
+
+(Real output with `CHUNK_SECONDS=20`: the chunk boundary landed at 19.3 s, in the pause
+between the two sentences, and timestamps continue across it.)
+
+**Decisions**
+
+- **Cut in silence, not at a fixed time.** A blind cut every N seconds splits words, and both
+  halves get mis-transcribed. Each cut goes at the quietest 100 ms window within the last 5 s
+  before the target length (RMS energy, a few lines of numpy, no extra VAD model). Ties go to
+  the latest window, so chunks stay close to the target length.
+- **Carry context across the cut.** The tail of the previous chunk's text is passed as
+  Whisper's prompt (`initial_prompt` locally, `prompt` on the API). Names, spelling and
+  punctuation stay consistent across chunks.
+- **Detect language once.** The first chunk's language is pinned for the rest. Otherwise a
+  chunk of music or silence can be "detected" as another language and come back garbled.
+- **Absolute timestamps.** Segments are shifted by the chunk offset and clamped to the chunk
+  end (Whisper sometimes predicts an end past the audio), so segments never overlap the next
+  chunk.
+- **Chunks cover the audio exactly once.** No overlap, so there is no de-duplication step to
+  get wrong. Tested by checking that the chunk sample counts sum to the input length.
+- **Validation still happens up front in streaming mode.** Bad input returns a real `4xx`
+  before the stream starts. A failure *mid-stream* (e.g. the upstream API goes down on chunk
+  7) arrives as an in-band `{"type": "error"}` event, because the `200` is already sent.
+  Segments already delivered are kept. Temp files are cleaned up even if the client
+  disconnects.
+- **Why 10 min chunks.** Whisper itself works in 30 s windows, so chunk size does not affect
+  accuracy, apart from the cut points, which are chosen in silence. Larger chunks mean fewer
+  boundaries and fewer API calls. Smaller chunks mean less memory and more frequent
+  progress. 10 min balances these and stays well under 25 MB.
+
+**What I would add for production** (deliberately not built here):
+
+- **Async jobs for very long or bulk audio.** `POST` returns a job id, workers pull from a
+  queue (SQS/Celery), audio and results live in object storage, and clients poll or get a
+  webhook. This survives restarts and retries a failed chunk instead of the whole file. A
+  streaming HTTP request does neither.
+- **Parallel chunks on the hosted engine.** Chunks are independent apart from the prompt, so
+  they could be fanned out with a concurrency limit for a large speed-up. That trades away
+  cross-chunk prompting; a good default for batch work.
+- **A duration cap per request** (e.g. `MAX_AUDIO_MINUTES`) as a cost guard, especially for
+  the hosted engine.

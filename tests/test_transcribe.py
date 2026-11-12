@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import openai
 import pytest
 
@@ -14,7 +15,7 @@ def test_returns_transcribed_text(client, fake):
     assert r.status_code == 200
     body = r.json()
     assert (body["filename"], body["engine"], body["language"]) == ("clip.wav", "fake", "en")
-    assert body["text"] == "hello world"
+    assert body["text"] == "hello1 world1"
     assert len(fake.calls) == 1
 
 
@@ -30,6 +31,9 @@ def test_load_audio_resamples_to_16k_mono(tmp_path):
     assert audio.ndim == 1
     assert abs(len(audio) - 2 * WHISPER_SAMPLE_RATE) < 100
     assert audio.dtype.name == "float32" and abs(audio).max() <= 1.0
+
+
+SAMPLES = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
 
 
 class StubClient:
@@ -50,24 +54,22 @@ class StubClient:
         )
 
 
-def test_openai_engine_requests_verbose_json(tmp_path):
-    path = tmp_path / "clip.wav"
-    path.write_bytes(make_wav())
+def test_openai_engine_requests_verbose_json():
     stub = StubClient()
-    result = OpenAIWhisperTranscriber("whisper-1", client=stub).transcribe(path)
+    result = OpenAIWhisperTranscriber("whisper-1", client=stub).transcribe(SAMPLES, prompt="ctx")
     assert result.text == "hi there"
     assert result.language == "en"
     assert stub.kwargs["model"] == "whisper-1"
     assert stub.kwargs["response_format"] == "verbose_json"
+    assert stub.kwargs["prompt"] == "ctx" and "language" not in stub.kwargs  # unset = omitted
+    assert stub.kwargs["file"][0] == "audio.flac"
     assert result.segments[0].end == 1.235 and result.segments[0].text == "hi there"
 
 
-def test_openai_engine_maps_upstream_errors(tmp_path):
-    path = tmp_path / "clip.wav"
-    path.write_bytes(make_wav())
+def test_openai_engine_maps_upstream_errors():
     engine = OpenAIWhisperTranscriber("whisper-1", client=StubClient(openai.OpenAIError("boom")))
     with pytest.raises(TranscriptionError):
-        engine.transcribe(path)
+        engine.transcribe(SAMPLES)
 
 
 def test_unknown_engine_fails_fast():

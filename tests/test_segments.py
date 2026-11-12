@@ -2,11 +2,11 @@ from conftest import make_wav
 
 
 def test_returns_timestamped_segments(client):
-    body = client.post("/transcribe", files={"file": ("clip.wav", make_wav())}).json()
+    body = client.post("/transcribe", files={"file": ("clip.wav", make_wav(seconds=2))}).json()
     assert body["duration"] == 2.0
     assert body["segments"] == [
-        {"start": 0.0, "end": 1.0, "text": "hello"},
-        {"start": 1.0, "end": 2.0, "text": "world"},
+        {"start": 0.0, "end": 1.0, "text": "hello1"},
+        {"start": 1.0, "end": 2.0, "text": "world1"},
     ]
 
 
