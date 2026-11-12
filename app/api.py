@@ -220,9 +220,8 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
                 # a file that turns out longer becomes a background job, not a long request.
                 sync_cfg = replace(cfg, max_duration_s=cfg.sync_max_duration_s)
                 try:
-                    result = pipeline.transcribe_file(
-                        path, sync_cfg, engine, language=language, filename=filename, info=info
-                    )
+                    result = pipeline.transcribe_file(path, sync_cfg, engine, language=language,
+                                                      filename=filename, info=info)
                     return _respond(result, format)
                 except AudioTooLongError:
                     pass
@@ -235,11 +234,8 @@ def create_app(cfg: Settings | None = None, engine: TranscriptionEngine | None =
                 lambda f: f.cancelled() and shutil.rmtree(workdir, ignore_errors=True)
             )
             location = f"/transcriptions/{job.job_id}"
-            return JSONResponse(
-                {"job_id": job.job_id, "status": job.status.value, "status_url": location},
-                status_code=202,
-                headers={"Location": location},
-            )
+            body = {"job_id": job.job_id, "status": job.status.value, "status_url": location}
+            return JSONResponse(body, status_code=202, headers={"Location": location})
         finally:
             if not handed_off:
                 shutil.rmtree(workdir, ignore_errors=True)
