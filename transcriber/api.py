@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from transcriber.audio import AudioError, save_upload
+from transcriber.audio import AudioError, AudioInfo, probe_audio, save_upload
 from transcriber.config import settings
 from transcriber.engines import Segment, Transcriber, TranscriptionError, get_transcriber
 
@@ -31,6 +31,7 @@ class TranscriptionResponse(BaseModel):
     duration: float
     text: str
     segments: list[Segment]
+    source: AudioInfo  # what was uploaded, as detected from the bytes
 
 
 @app.exception_handler(AudioError)
@@ -53,5 +54,8 @@ def transcribe(
 ) -> TranscriptionResponse:
     with tempfile.TemporaryDirectory() as tmp:
         path = save_upload(file.file, file.filename, tmp, settings.max_upload_bytes)
+        source = probe_audio(path)  # reject non-audio before spending model time on it
         result = transcriber.transcribe(path)
-    return TranscriptionResponse(filename=file.filename, engine=transcriber.name, **asdict(result))
+    return TranscriptionResponse(
+        filename=file.filename, engine=transcriber.name, source=source, **asdict(result)
+    )

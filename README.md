@@ -36,6 +36,8 @@ Interactive API docs: <http://localhost:8000/docs>
 
 ### 1. Accept an audio file (WAV or MP3)
 
+WAV and MP3 are accepted, along with every format in Q4.
+
 `POST /transcribe` takes a `multipart/form-data` upload in the `file` field.
 
 **Decisions**
@@ -91,7 +93,8 @@ Response shape is shown in Q3.
   "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny.",
   "segments": [
     {"start": 0.0, "end": 4.76, "text": "Hello, this is a test of the transcription pipeline, the weather today is sunny."}
-  ]
+  ],
+  "source": {"container": "wav", "codec": "pcm_s16le", "sample_rate": 16000, "channels": 1, "duration": 4.942}
 }
 ```
 
@@ -112,3 +115,39 @@ Response shape is shown in Q3.
   length) and compute real-time factor without decoding the file again.
 - **Typed response model** (`TranscriptionResponse`), so the contract is enforced and shows
   up in the OpenAPI docs at `/docs`.
+
+### 4. How do you handle different audio formats?
+
+**Decode everything once, at one place, into one canonical form: 16 kHz mono float32 PCM.**
+That is what Whisper consumes internally, so converting to it loses nothing, and after that
+point no code in the pipeline knows or cares what the input was.
+
+Accepted: WAV, MP3, M4A/AAC, FLAC, OGG/Opus, WebM, MP4 (audio track), AIFF, WMA, AMR.
+Verified by tests that encode real files in each format and check the decoded output.
+
+**Decisions**
+
+- **PyAV (FFmpeg libraries) as the single decoder.** FFmpeg reads practically every
+  container and codec. PyAV links it in-process, so there is no `ffmpeg` binary to install,
+  version-match or shell out to (no subprocess, no command-injection surface), and the
+  service ships as a plain `pip`/`uv` install. Open-source Whisper normally *requires* a
+  system `ffmpeg`; decoding ourselves removes that.
+- **Identify by content, not extension.** The extension is a cheap first gate (checked before
+  the body hits disk), but `probe_audio` opens the file with FFmpeg's demuxer probing. An MP3
+  renamed to `.wav` is still detected and transcribed. A text file renamed `.mp3`, or a
+  truncated file, gets `422` *before* any model time is spent. A video with no audio track gets
+  `415`.
+- **Resample and downmix in the decoder** (`AudioResampler`): 44.1/48 kHz → 16 kHz, stereo or
+  5.1 → mono, any bit depth → float32. Sample-rate mismatches are a classic silent accuracy
+  bug (audio fed at the wrong rate sounds sped-up to the model); this rules it out.
+- **The hosted engine gets normalised audio too.** Instead of forwarding the original upload,
+  it sends 16 kHz mono **FLAC**: lossless, about half the size of WAV and much smaller than a
+  48 kHz stereo original. That means (a) every input format works, though the API itself
+  accepts only ~10, (b) uploads are faster, (c) more audio fits under the 25 MB API limit.
+  Whisper downsamples to 16 kHz mono server-side anyway, so quality is identical.
+- **`source` metadata in the response** (detected container, codec, original rate/channels,
+  duration) for debugging and downstream auditing. It reflects the bytes, not the
+  client's claim.
+
+Trade-off: decoding the whole file into memory costs 64 KB per second of audio, which is fine
+for minutes and wasteful for hours. Q5 fixes that.

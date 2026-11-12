@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
-from transcriber.audio import WHISPER_SAMPLE_RATE, load_audio
+from transcriber.audio import WHISPER_SAMPLE_RATE, encode_audio, load_audio
 from transcriber.config import Settings, settings
 
 
@@ -96,14 +96,17 @@ class OpenAIWhisperTranscriber:
     def transcribe(self, audio_path: Path) -> Transcription:
         import openai
 
+        # Send normalised 16 kHz mono FLAC rather than the original file: every input format
+        # works (the API accepts only ~10), and uploads shrink (Whisper resamples to 16 kHz
+        # mono server-side anyway, so nothing is lost).
+        payload = ("audio.flac", encode_audio(load_audio(audio_path)), "audio/flac")
         try:
-            with open(audio_path, "rb") as f:
-                result = self._client.audio.transcriptions.create(
-                    model=self._model,
-                    file=f,
-                    response_format="verbose_json",  # the only format that returns segments
-                    timestamp_granularities=["segment"],
-                )
+            result = self._client.audio.transcriptions.create(
+                model=self._model,
+                file=payload,
+                response_format="verbose_json",  # the only format that returns segments
+                timestamp_granularities=["segment"],
+            )
         except openai.OpenAIError as e:
             raise TranscriptionError(f"Upstream transcription failed: {e}") from e
         return Transcription(
