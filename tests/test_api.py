@@ -214,3 +214,27 @@ def test_header_that_understates_length_becomes_a_job(client, tmp_path):
     assert r.status_code == 202  # not a 2-minute transcription inside the HTTP request
     done = _wait_for_job(client, r.json()["job_id"]).json()
     assert done["duration"] > 100 and done["segments"][-1]["end"] > 100
+
+
+def test_corrupt_file_returns_415(client, tmp_path):
+    import os
+
+    broken = tmp_path / "broken.wav"
+    broken.write_bytes(os.urandom(50_000))
+    r = post(client, broken)
+    assert r.status_code == 415 and "audio" in r.json()["detail"]
+
+
+def test_failed_job_reports_status_and_error(cfg, make_gapped):
+    from app.engines import TranscriptionError
+
+    class Down(MockEngine):
+        def transcribe(self, wav_path, language=None):
+            raise TranscriptionError("openai: down; faster-whisper: out of memory")
+
+    with TestClient(create_app(replace(cfg, sync_max_duration_s=10.0), Down())) as c:
+        r = post(c, make_gapped(seconds=30))
+        assert r.status_code == 202
+        job = _wait_for_job(c, r.json()["job_id"]).json()
+    assert job["status"] == "failed"
+    assert "out of memory" in job["error"]
