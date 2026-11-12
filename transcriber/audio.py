@@ -1,6 +1,7 @@
 """Audio input handling: validation, format probing, decoding and encoding."""
 
 import io
+import itertools
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,7 +113,8 @@ def _decode_blocks(path: str | Path) -> Iterator[np.ndarray]:
     try:
         with av.open(str(path)) as container:
             resampler = av.AudioResampler(format="s16", layout="mono", rate=WHISPER_SAMPLE_RATE)
-            for frame in [*container.decode(audio=0), None]:  # None flushes the resampler
+            # chain(), not a list: a list would decode the whole file before the first chunk.
+            for frame in itertools.chain(container.decode(audio=0), [None]):  # None flushes
                 for out in resampler.resample(frame):
                     produced = True
                     yield out.to_ndarray().ravel().astype(np.float32) / 32768.0

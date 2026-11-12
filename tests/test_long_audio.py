@@ -108,3 +108,22 @@ def test_stream_reports_mid_stream_failure_in_band(client, long_file, monkeypatc
     events = [json.loads(line) for line in r.text.splitlines()]
     assert events[-1] == {"type": "error", "status": 502, "detail": "upstream down"}
     assert sum(e["type"] == "segment" for e in events) == 2  # first chunk was still delivered
+
+
+def test_decoding_is_streamed_not_buffered(tmp_path, monkeypatch):
+    """The first chunk must come back before the rest of the file is decoded."""
+    import av
+
+    path = tmp_path / "minute.flac"
+    path.write_bytes(encode_audio(speech_like(60)))
+    decoded = {"seconds": 0.0}
+    real_decode = av.container.InputContainer.decode
+
+    def counting_decode(self, *args, **kwargs):
+        for frame in real_decode(self, *args, **kwargs):
+            decoded["seconds"] += frame.samples / frame.sample_rate
+            yield frame
+
+    monkeypatch.setattr(av.container.InputContainer, "decode", counting_decode)
+    next(iter_chunks(path, chunk_seconds=10))
+    assert decoded["seconds"] < 12  # ~one chunk plus a frame, not all 60 s
