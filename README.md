@@ -175,7 +175,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, `RequestGuard` (auth and size checked before the body is read), upload streaming, in-memory `JobStore`, HTTP error mapping |
-| [`tests/`](tests/) | 77 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
+| [`tests/`](tests/) | 81 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
 
 ---
 
@@ -190,7 +190,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 
 ### Long audio
 
-- **Limits.** FastAPI reads the whole multipart body before any endpoint code runs, so a size check in the endpoint would only fire after a huge upload had already filled the disk. A small ASGI middleware (`RequestGuard`) therefore checks the API key and the declared `Content-Length` before reading anything, and counts bytes as they arrive, so the limit also holds for chunked uploads that send no `Content-Length`. The exact file size is checked again while the file is saved. Over-limit requests are rejected after 0 bytes have been read. The duration limit (`TP_MAX_DURATION_S`, default 4 h) is checked with ffprobe before any decoding work starts.
+- **Limits.** FastAPI reads the whole multipart body before any endpoint code runs, so a size check in the endpoint would only fire after a huge upload had already filled the disk. A small ASGI middleware (`RequestGuard`) therefore checks the API key and the declared `Content-Length` before reading anything, and counts bytes as they arrive, so the limit also holds for chunked uploads that send no `Content-Length`. The exact file size is checked again while the file is saved. Over-limit requests are rejected after 0 bytes have been read. The duration limit (`TP_MAX_DURATION_S`, default 4 h) is checked with ffprobe before any decoding work starts. That check reads headers, which a crafted file can fake (in testing, an MP3 that probed as 95 s decoded to an hour), so decoding also stops just past the limit (`ffmpeg -t`) and the real decoded length is checked again (413). Every ffmpeg/ffprobe call has a 10-minute timeout, so a file that makes ffmpeg hang cannot pin a worker.
 - **Synchronous vs background.** Audio up to `TP_SYNC_MAX_DURATION_S` (120 s) is answered in the request. Anything longer returns **202** with a job ID and is processed on a `ThreadPoolExecutor`. `GET /transcriptions/{id}` reports `progress` after each chunk. Jobs are kept in an in-memory `JobStore`. **In production this would be TaskIQ or Celery on Redis for the queue, object storage (S3/GCS) for uploaded audio, and Postgres for job state and results**, so jobs survive restarts and workers can scale separately from the API.
 - **Why chunk when Whisper already uses 30 s windows internally?**
   - *Bounded memory.* A 4-hour file is about 460 MB of PCM. Each chunk holds roughly 19 MB.

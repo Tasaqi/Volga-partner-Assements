@@ -5,7 +5,8 @@ import pytest
 
 from app.audio import AudioTooLongError
 from app.engines import EngineResult, MockEngine, TranscriptionError
-from app.pipeline import transcribe_file
+from app.pipeline import inspect, transcribe_file
+from tests.conftest import ffmpeg
 
 LONG = dict(chunk_seconds=10.0, silence_search_s=3.0, chunk_overlap_s=1.0)
 
@@ -34,6 +35,26 @@ def test_max_duration_is_enforced(make_tone, cfg, engine):
     with pytest.raises(AudioTooLongError):
         transcribe_file(src, replace(cfg, max_duration_s=4.0), engine)
 
+
+
+def lying_mp3(tmp_path):
+    """Probes as ~8 s but decodes to ~125 s: a 320 kb/s head on an 8 kb/s tail with no
+    Xing header, so ffprobe estimates the whole length from the head's bitrate."""
+    head, tail, out = (tmp_path / n for n in ("head.mp3", "tail.mp3", "lying.mp3"))
+    ffmpeg("-f", "lavfi", "-i", "sine=f=440:d=5", "-ac", "1", "-ar", "44100",
+           "-c:a", "libmp3lame", "-b:a", "320k", "-write_xing", "0", str(head))
+    ffmpeg("-f", "lavfi", "-i", "anoisesrc=d=120:a=0.1", "-ac", "1", "-ar", "8000",
+           "-c:a", "libmp3lame", "-b:a", "8k", "-write_xing", "0", "-id3v2_version", "0", str(tail))
+    out.write_bytes(head.read_bytes() + tail.read_bytes())
+    return out
+
+
+def test_faked_duration_header_is_caught_after_decoding(tmp_path, cfg, engine):
+    src = lying_mp3(tmp_path)
+    limited = replace(cfg, max_duration_s=60.0)
+    assert inspect(src, limited).duration < 60  # the header check alone is fooled
+    with pytest.raises(AudioTooLongError, match="header"):
+        transcribe_file(src, limited, engine)
 
 @pytest.mark.parametrize("workers", [1, 3])
 def test_long_file_has_ordered_absolute_timestamps(make_gapped, cfg, engine, workers):

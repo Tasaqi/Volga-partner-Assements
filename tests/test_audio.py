@@ -1,3 +1,4 @@
+import subprocess
 import wave
 from pathlib import Path
 
@@ -65,3 +66,17 @@ def test_extract_is_sample_exact(make_gapped, tmp_path: Path):
     wav = make_gapped(seconds=10)
     part = audio.extract(wav, 2.0, 5.5, tmp_path / "part.wav")
     assert audio.wav_duration(part) == pytest.approx(3.5, abs=1e-4)
+
+
+def test_normalise_stops_at_max_seconds(make_tone, tmp_path: Path):
+    out = audio.normalise(make_tone("long.wav", 5.0), tmp_path / "out.wav", max_seconds=2.0)
+    assert audio.wav_duration(out) == pytest.approx(2.0, abs=0.05)
+
+
+def test_ffmpeg_timeout_becomes_unsupported_audio(monkeypatch, tmp_path: Path):
+    def hang(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(audio.subprocess, "run", hang)
+    with pytest.raises(UnsupportedAudioError, match="timed out"):
+        audio.probe(tmp_path / "upload")

@@ -65,8 +65,18 @@ class Chunk:
 LOCAL_ONLY = ["-protocol_whitelist", "file"]
 
 
+# A crafted file can make ffmpeg spin forever; never let one pin a worker thread.
+# shortcut: one fixed limit for every call; scale it with duration if slow CPUs hit it on 4 h files.
+FFMPEG_TIMEOUT_S = 600
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=FFMPEG_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired as exc:  # subprocess.run has already killed the child
+        raise UnsupportedAudioError(f"{cmd[0]} timed out after {FFMPEG_TIMEOUT_S}s") from exc
 
 
 def probe(path: Path) -> AudioInfo:
@@ -105,12 +115,16 @@ def _to_float(value: object) -> float | None:
         return None
 
 
-def normalise(src: Path, dst: Path) -> Path:
-    """Decode any input to 16 kHz mono 16-bit PCM WAV (drops video)."""
+def normalise(src: Path, dst: Path, max_seconds: float | None = None) -> Path:
+    """Decode any input to 16 kHz mono 16-bit PCM WAV (drops video).
+
+    ``max_seconds`` stops decoding there, bounding CPU and disk whatever the header claims.
+    """
+    limit = ["-t", str(max_seconds)] if max_seconds else []
     proc = _run(
         [
             "ffmpeg", "-nostdin", "-v", "error", "-y", *LOCAL_ONLY, "-i", str(src),
-            "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", str(dst),
+            "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-c:a", "pcm_s16le", *limit, str(dst),
         ]
     )
     if proc.returncode != 0 or not dst.exists():

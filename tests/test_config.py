@@ -15,3 +15,8 @@ def test_blank_env_values_mean_default(monkeypatch):
     monkeypatch.setenv("TP_CHUNK_SECONDS", "300")
     cfg = Settings.from_env()
     assert (cfg.chunk_workers, cfg.chunk_seconds) == (1, 300.0)
+
+
+def test_float_env_value_for_max_duration(monkeypatch):
+    monkeypatch.setenv("TP_MAX_DURATION_S", "14400.5")  # int default used to make this crash
+    assert Settings.from_env().max_duration_s == 14400.5

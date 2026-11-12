@@ -29,7 +29,7 @@ class Settings:
 
     # Input limits
     max_upload_mb: int = 500
-    max_duration_s: float = 4 * 3600
+    max_duration_s: float = 4 * 3600.0  # float: from_env casts env values with type(default)
 
     # Files longer than this become a background job (HTTP 202)
     sync_max_duration_s: float = 120.0

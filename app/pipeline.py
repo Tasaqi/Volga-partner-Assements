@@ -77,8 +77,14 @@ def transcribe_file(
     info = info or inspect(path, cfg)
 
     with tempfile.TemporaryDirectory(prefix="tp-") as tmp:
-        wav = audio.normalise(path, Path(tmp) / "audio.wav")
+        # ffprobe's duration comes from headers, which can lie (a crafted MP3 probed as 95 s
+        # decoded to an hour). Decode at most just past the limit, then check the real length.
+        wav = audio.normalise(path, Path(tmp) / "audio.wav", max_seconds=cfg.max_duration_s + 1)
         duration = audio.wav_duration(wav)
+        if duration > cfg.max_duration_s:
+            raise AudioTooLongError(
+                f"Audio is longer than its header says; the maximum is {cfg.max_duration_s:.0f}s"
+            )
 
         silences = (
             audio.detect_silences(wav, cfg.silence_noise_db, cfg.silence_min_s)
