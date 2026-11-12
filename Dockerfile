@@ -21,7 +21,6 @@ RUN python -c "from faster_whisper import WhisperModel; WhisperModel('${MODEL_SI
 ENV HF_HUB_OFFLINE=1
 
 COPY app ./app
-COPY cli.py .
 
 RUN useradd --create-home appuser
 USER appuser

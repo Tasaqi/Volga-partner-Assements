@@ -1,7 +1,7 @@
 """Orchestration: probe -> normalise -> plan chunks -> transcribe chunks -> merge -> clean.
 
-The pipeline knows nothing about HTTP; the API and the CLI both call
-:func:`transcribe_file`.
+The pipeline knows nothing about HTTP: the API calls :func:`transcribe_file`,
+and it can be reused from a worker or script unchanged.
 """
 
 from __future__ import annotations

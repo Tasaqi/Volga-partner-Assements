@@ -1,6 +1,6 @@
 # Transcription Pipeline
 
-A speech-to-text service you can run two ways: as an HTTP API (FastAPI) or from the command line. Send it an audio or video file in any common format, of any length up to 4 hours. It returns a transcript with absolute timestamps for every segment, as JSON, SRT, VTT or plain text.
+A speech-to-text HTTP service built with FastAPI. Send it an audio or video file in any common format, of any length up to 4 hours. It returns a transcript with absolute timestamps for every segment, as JSON, SRT, VTT or plain text.
 
 Transcription uses the **OpenAI Whisper API** as the primary engine. If an API call fails, or no `OPENAI_API_KEY` is set, the service falls back to [faster-whisper](https://github.com/SYSTRAN/faster-whisper), the open-source Whisper model running locally on CTranslate2. A failure costs only the affected chunk, not the request. No model is trained here. All decoding, probing and silence detection go through `ffmpeg` and `ffprobe`.
 
@@ -23,18 +23,6 @@ pip install -r requirements.txt
 cp .env.example .env    # settings and credentials live here; never commit it
 ```
 
-### CLI
-
-```bash
-python cli.py input.mp3 --format srt -o out.srt --model base --language en
-python cli.py lecture.mp4                       # JSON to stdout, language auto-detected
-python cli.py input.wav --engine mock           # offline demo, no model download
-```
-
-Set `OPENAI_API_KEY` to use the OpenAI API, with local Whisper as the fallback. Without a key, everything runs locally on faster-whisper.
-
-Progress is printed to stderr. Exit code `2` means the input was rejected (not audio, too long).
-
 ### API
 
 ```bash
@@ -47,6 +35,8 @@ curl -F "file=@meeting.m4a" "localhost:8000/transcriptions?format=srt"
 curl -i -F "file=@podcast.mp3" localhost:8000/transcriptions
 curl localhost:8000/transcriptions/<job_id>
 ```
+
+Set `OPENAI_API_KEY` in `.env` to use the OpenAI API, with local Whisper as the fallback. Without a key, everything runs locally on faster-whisper. For an offline demo with no model download, start the server with `TP_ENGINE=mock`.
 
 Interactive docs: <http://localhost:8000/docs>
 
@@ -129,7 +119,7 @@ This is real output from the `tiny` model on a macOS `say` recording. `processin
 ## Pipeline
 
 ```
- upload / CLI path
+ upload
         │
         ▼
  ┌──────────────┐  stream to disk in 1 MB pieces, size limit (413), empty check (400)
@@ -175,7 +165,6 @@ This is real output from the `tiny` model on a macOS `say` recording. `processin
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, upload streaming, in-memory `JobStore`, HTTP error mapping |
-| [`cli.py`](cli.py) | Command-line wrapper around `transcribe_file` |
 | [`tests/`](tests/) | 57 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API and auth |
 
 ---
@@ -229,7 +218,7 @@ The pipeline only knows the `TranscriptionEngine` protocol (`name`, `model`, `tr
 
 ### Configuration
 
-All settings are environment variables prefixed with `TP_`. [`.env.example`](.env.example) lists them all; copy it to `.env` (git- and docker-ignored) and pass it with `--env-file`. The CLI reads the shell environment, so load it with `set -a; source .env; set +a`.
+All settings are environment variables prefixed with `TP_`. [`.env.example`](.env.example) lists them all; copy it to `.env` (git- and docker-ignored) and pass it with `--env-file`.
 
 | Variable | Default | Purpose |
 |---|---|---|

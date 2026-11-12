@@ -1,4 +1,4 @@
-"""Public data models returned by the API and CLI."""
+"""Public data models returned by the API."""
 
 from __future__ import annotations
 
