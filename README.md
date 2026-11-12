@@ -56,7 +56,7 @@ The model is downloaded while the image builds, and the container runs with `HF_
 pytest -q
 ```
 
-The tests use `MockEngine`, so they never download a model. They take about 5 seconds.
+The tests use `MockEngine`, so they never download a model. They take about 10 seconds.
 
 ---
 
@@ -140,7 +140,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
  │    probe     │  duration ≤ TP_MAX_DURATION_S (413)
  └──────┬───────┘  record codec / container / rate / channels
         │
-        ├── duration > TP_SYNC_MAX_DURATION_S ──► 202 + job_id ──► ThreadPoolExecutor
+        ├── length > TP_SYNC_MAX_DURATION_S ──► 202 + job_id ──► ThreadPoolExecutor
         ▼                                                                 │
  ┌──────────────┐  ffmpeg -vn -ac 1 -ar 16000 -c:a pcm_s16le              │
  │  normalise   │  ── every later stage sees ONLY this format ──          │
@@ -175,11 +175,20 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 | [`app/pipeline.py`](app/pipeline.py) | `transcribe_file`: orchestration, parallel chunks, thread-safe progress, timestamp merge |
 | [`app/postprocess.py`](app/postprocess.py) | Text cleanup, hallucination filter, confidence, SRT / VTT / TXT rendering |
 | [`app/api.py`](app/api.py) | `create_app(cfg, engine)` factory, `RequestGuard` (auth and size checked before the body is read), upload streaming, in-memory `JobStore`, HTTP error mapping |
-| [`tests/`](tests/) | 81 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
+| [`tests/`](tests/) | 85 tests covering audio, chunking, post-processing, engines and fallback, the pipeline, the API, auth and configuration |
 
 ---
 
 ## Design decisions
+
+**At a glance**
+
+- **Trust content, not names.** ffprobe checks every upload for a real audio stream (else 415). ffmpeg then converts everything once to 16 kHz mono 16-bit PCM WAV, so later stages handle a single format.
+- **Reject early.** API key and size are checked before the body is read (401/413). Duration is checked from the header and again after decoding (413, 4 h maximum).
+- **Short in the request, long in the background.** Up to 120 s of audio is answered in the request (200). Longer files return 202 with a job ID to poll.
+- **Chunk for control, not for Whisper.** About 10-minute chunks keep memory bounded and allow real progress, parallel workers and per-chunk retry. Cuts land in silence; a hard cut gets 2 s of overlap. A midpoint-ownership merge keeps each segment exactly once, with absolute timestamps.
+- **API speed, local resilience.** The OpenAI Whisper API is primary. Local faster-whisper redoes any failed chunk, and a circuit breaker skips OpenAI for 60 s during real outages. Trade-off: the default sends audio to OpenAI; one setting keeps it local.
+- **Same output whatever the engine.** Both engines return segment log-probabilities, so the confidence score, hallucination filter and SRT/VTT output are identical.
 
 ### Different audio formats
 
@@ -190,8 +199,8 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 
 ### Long audio
 
-- **Limits.** FastAPI reads the whole multipart body before any endpoint code runs, so a size check in the endpoint would only fire after a huge upload had already filled the disk. A small ASGI middleware (`RequestGuard`) therefore checks the API key and the declared `Content-Length` before reading anything, and counts bytes as they arrive, so the limit also holds for chunked uploads that send no `Content-Length`. The exact file size is checked again while the file is saved. Over-limit requests are rejected after 0 bytes have been read. The duration limit (`TP_MAX_DURATION_S`, default 4 h) is checked with ffprobe before any decoding work starts. That check reads headers, which a crafted file can fake (in testing, an MP3 that probed as 95 s decoded to an hour), so decoding also stops just past the limit (`ffmpeg -t`) and the real decoded length is checked again (413). Every ffmpeg/ffprobe call has a 10-minute timeout, so a file that makes ffmpeg hang cannot pin a worker.
-- **Synchronous vs background.** Audio up to `TP_SYNC_MAX_DURATION_S` (120 s) is answered in the request. Anything longer returns **202** with a job ID and is processed on a `ThreadPoolExecutor`. `GET /transcriptions/{id}` reports `progress` after each chunk. Jobs are kept in an in-memory `JobStore`. **In production this would be TaskIQ or Celery on Redis for the queue, object storage (S3/GCS) for uploaded audio, and Postgres for job state and results**, so jobs survive restarts and workers can scale separately from the API.
+- **Limits.** FastAPI reads the whole multipart body before any endpoint code runs, so a size check in the endpoint would only fire after a huge upload had already filled the disk. A small ASGI middleware (`RequestGuard`) therefore checks the API key and the declared `Content-Length` before reading anything, and counts bytes as they arrive, so the limit also holds for chunked uploads that send no `Content-Length`. The exact file size is checked again while the file is saved. When the client declares the size, an over-limit or unauthenticated request is rejected after 0 bytes of the body have been read (checked with curl against a live server). The duration limit (`TP_MAX_DURATION_S`, default 4 h) is checked with ffprobe before any decoding work starts. That check reads headers, which a crafted file can fake (in testing, an MP3 that probed as 95 s decoded to an hour), so decoding also stops just past the limit (`ffmpeg -t`) and the real decoded length is checked again (413). Every ffmpeg/ffprobe call has a 10-minute timeout, so a file that makes ffmpeg hang cannot pin a worker.
+- **Synchronous vs background.** Audio up to `TP_SYNC_MAX_DURATION_S` (120 s) is answered in the request. Because the probed duration comes from headers, the in-request path decodes at most 120 s; a file that turns out longer than its header claimed is handed to a background job instead of tying up the request. Anything longer returns **202** with a job ID and is processed on a `ThreadPoolExecutor`. `GET /transcriptions/{id}` reports `progress` after each chunk. Jobs are kept in an in-memory `JobStore`. **In production this would be TaskIQ or Celery on Redis for the queue, object storage (S3/GCS) for uploaded audio, and Postgres for job state and results**, so jobs survive restarts and workers can scale separately from the API.
 - **Why chunk when Whisper already uses 30 s windows internally?**
   - *Bounded memory.* A 4-hour file is about 460 MB of PCM. Each chunk holds roughly 19 MB.
   - *Progress.* faster-whisper yields segments lazily but cannot report a reliable fraction done. Counting chunks gives a real `progress` value.
@@ -220,7 +229,7 @@ This is real output from the local `tiny` model on a two-sentence macOS `say` re
 - **Fail at startup, not mid-outage.** Every local model in the chain is loaded when the service starts, under a lock, so parallel first requests cannot each load their own multi-GB copy. A broken fallback should stop the deploy, not appear for the first time during an OpenAI incident. A missing `OPENAI_API_KEY` logs a warning and the chain runs without OpenAI, whether OpenAI was the primary or the fallback, so the service still works offline and in CI. Invalid settings (for example `TP_CHUNK_SECONDS=0`) also fail at startup with a clear message, and blank values in `.env` mean "use the default".
 - **Errors from both engines look the same.** OpenAI SDK errors and local CTranslate2 `RuntimeError`s (for example, out of memory) both become `TranscriptionError`. That makes the reverse chain work too (`TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=openai`). If both engines fail, the error message names both causes.
 - **Traceable output.** `metadata.engine` shows the chain (`openai+faster-whisper`) and `metadata.fallback_chunks` counts how many chunks the fallback produced. A drop in quality can then be traced to its cause.
-- **Same output from both engines.** Each chunk is sent to OpenAI as lossless FLAC, about half the size of WAV: a 10-minute chunk is roughly 10 MB, well under the API's 25 MB limit. The request uses `verbose_json`, so the response includes `avg_logprob` and `no_speech_prob`, and the confidence score and hallucination filter work exactly as they do for local output. Language names are mapped to ISO codes.
+- **Same output from both engines.** Each chunk is sent to OpenAI as lossless FLAC. For speech that is about half the size of WAV (measured 0.51x), so a 10-minute chunk is about 10 MB. Noise barely compresses (measured 0.93x), so the bound that matters is the worst case: with the defaults, the longest chunk is 634 s, about 20 MB even uncompressed. At startup the service refuses chunk settings that could pass OpenAI's 25 MB upload limit (`TP_CHUNK_SECONDS + TP_SILENCE_SEARCH_S + 2 x TP_CHUNK_OVERLAP_S` must be at most 781 s). The request uses `verbose_json`, so the response includes `avg_logprob` and `no_speech_prob`, and the confidence score and hallucination filter work exactly as they do for local output. Language names are mapped to ISO codes.
 - **Privacy trade-off.** The default sends audio to OpenAI. For sensitive recordings, set `TP_ENGINE=faster-whisper TP_FALLBACK_ENGINE=none` and audio never leaves the machine.
 
 ### Extensibility
