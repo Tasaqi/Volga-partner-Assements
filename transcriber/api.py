@@ -43,8 +43,10 @@ def pipeline_error_handler(_: Request, exc: AudioError | TranscriptionError) -> 
     return JSONResponse(status_code=exc.status_code, content={"detail": str(exc)})
 
 
+# `async` so it runs on the event loop, not in the worker thread pool: when every worker is
+# busy transcribing, the health check must still answer or the orchestrator kills the pod.
 @app.get("/health")
-def health() -> dict:
+async def health() -> dict:
     return {"status": "ok"}
 
 
